@@ -1,0 +1,26 @@
+Performance Metrics Summary
+            ==================================================
+
+            Execution Time: 115.00 seconds
+            Sampling Interval: 0.25 seconds
+            Total Samples: 455
+
+CPU Metrics:
+            Average CPU Usage: 9.2%
+            Peak CPU Usage: 63.1%
+            Min CPU Usage: 4.9%
+
+Memory Metrics:
+            Average Memory Usage: 6.7%
+            Peak Memory Usage: 7.7%
+            Peak Memory Used: 16.45 GB
+
+Disk I/O Metrics:
+            Total Data Read: 0.00 MB
+            Total Data Written: 98.75 MB
+            
+GPU Metrics:
+                Average GPU Utilization: 73.3%
+                Peak GPU Utilization: 100.0%
+                Peak GPU Memory Used: 22.71 GB
+                

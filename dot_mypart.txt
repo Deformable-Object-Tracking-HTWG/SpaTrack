@@ -1,0 +1,2448 @@
+======================================================================
+Dateiname:      eval_pipeline.py
+Relativer Pfad: ../eval_pipeline.py
+----------------------------------------------------------------------
+"""
+Evaluation pipeline.
+
+Flow:
+  1) Build URLs from host/token/slug and prepare a timestamped run directory.
+  2) Download video and ensure H.264.
+  3) Create a first-frame object mask (SAM + CLIP with gym ball bias).
+  4) Run SpatialTracker.
+  5) Download TOF .npy files from the public Nextcloud share.
+  6) Analyze tracker vs. TOF (writes artifacts to analysis/).
+  7) Create TOF overlay video (uses analysis products if needed).
+
+Every run gets its own folder: <base-dir>/<YYYY-MM-DD_HH-MM-SS>_<slug>/
+"""
+
+from __future__ import annotations
+import argparse
+import datetime as dt
+import os
+import sys
+from pathlib import Path
+import gc
+
+from eval_tof_utils.video_io import download_and_ensure_h264
+from eval_tof_utils.masking import create_semantic_mask
+from eval_tof_utils.tracker import run_spatial_tracker
+from eval_tof_utils.tof_download import download_all_npy_from_nextcloud_folder
+from eval_tof_utils.analysis import analyze_results
+from eval_tof_utils.tof_overlay import create_tof_overlay_video, probe_video_fps
+
+
+# ----------------------------- CLI -----------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="End-to-end evaluation pipeline for RGB video + TOF data."
+    )
+
+    # Core inputs
+    p.add_argument("--host", required=True, help="Nextcloud host, e.g. cloud.example.org")
+    p.add_argument("--public-token", required=True, help="Public share token")
+    p.add_argument("--slug", required=True,
+                   help="Clip slug (the only changing part), e.g. Gymnastik_6_5s")
+
+    # Optional password for the public share
+    p.add_argument("--tof-share-password", default="", help="Password if the share is protected")
+
+    # Environment
+    p.add_argument("--base-dir", default="evaluation", help="Base directory for all runs")
+    p.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Computation device")
+
+    # Masking
+    p.add_argument("--ref-images", required=True,
+                   help="Directory with reference images used for CLIP similarity")
+    p.add_argument("--sam-checkpoint", required=True, help="Path to SAM checkpoint (.pth)")
+    p.add_argument("--sam-model-type", default="vit_h", choices=["vit_h", "vit_l", "vit_b"])
+    p.add_argument("--center-priority", action="store_true",
+                   help="Prefer segment closest to center (overrides CLIP)")
+
+    # Tracker
+    p.add_argument("--tracker-script", default="chunked_demo.py", help="SpatialTracker script path")
+    p.add_argument("--chunk-size", type=int, default=30, help="Frames per chunk for tracker")
+
+    return p.parse_args()
+
+
+# ----------------------------- Helpers -----------------------------
+
+def build_urls(host: str, token: str, slug: str) -> tuple[str, str, str]:
+    """
+    Build:
+      - direct WebDAV video URL
+      - public share folder URL (for .npy)
+      - local filename
+    """
+
+    video_filename = f"{slug}.mp4"
+    base_path = f"/TOF_camera/{slug}/rgbd_data/{slug}"
+
+    video_url = f"https://{host}/public.php/dav/files/{token}{base_path}.mp4"
+    # The ?path= needs URL-encoding for slashes (%2F), but downstream handles that.
+    tof_share_url = f"https://{host}/s/{token}?path=%2FTOF_camera%2F{slug}%2Frgbd_data%2F{slug}"
+    return video_url, tof_share_url, video_filename
+
+
+def make_run_dirs(base_dir: Path, slug: str) -> dict[str, Path]:
+    stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = base_dir / f"{stamp}_{slug}"
+
+    sub = {
+        "run": run_dir,
+        "video": run_dir / "video",
+        "mask": run_dir / "mask",
+        "tracker": run_dir / "tracker",
+        "tof": run_dir / "tof",
+        "analysis": run_dir / "analysis",
+        "overlay": run_dir / "overlay",
+    }
+    for p in sub.values():
+        p.mkdir(parents=True, exist_ok=True)
+    return sub
+
+
+def fail(msg: str) -> None:
+    print(f"❌ {msg}")
+    sys.exit(1)
+
+
+def cleanup_gpu(device: str) -> None:
+    """
+    Aggressively release GPU memory (safe to call without torch/cuda).
+    """
+    try:
+        import torch  # type: ignore
+        if device == "cuda" and torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            try:
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        gc.collect()
+
+
+# ----------------------------- Main -----------------------------
+
+def main() -> None:
+    args = parse_args()
+
+    base_dir = Path(args.base_dir)
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    video_url, tof_share_url, video_filename = build_urls(
+        host=args.host, token=args.public_token, slug=args.slug
+    )
+
+    dirs = make_run_dirs(base_dir, args.slug)
+
+    # 1) Video (download + ensure H.264)
+    h264_video = download_and_ensure_h264(
+        url=video_url, folder=str(dirs["video"]), filename=video_filename
+    )
+    if not h264_video:
+        fail("Video step failed")
+
+    # 2) Mask (SAM + CLIP)
+    mask_path = None
+    try:
+        mask_path = create_semantic_mask(
+            video_path=h264_video,
+            output_folder=str(dirs["mask"]),
+            reference_images_dir=args.ref_images,
+            sam_checkpoint=args.sam_checkpoint,
+            model_type=args.sam_model_type,
+            device=args.device,
+            use_center_priority=args.center_priority,
+            target_class="exercise ball",
+            disallow_classes=["person", "shirt", "man", "t-shirt"],
+            enforce_circularity=True,
+        )
+    finally:
+        print("🧹 Releasing GPU memory after mask generation ...")
+        cleanup_gpu(args.device)
+
+    if not mask_path:
+        fail("Mask creation failed")
+
+
+    # 3) Tracker
+    tracking_file = run_spatial_tracker(
+        video_path=h264_video,
+        mask_path=mask_path,
+        chunk_size=args.chunk_size,
+        output_folder=str(dirs["tracker"]),
+        tracker_script=args.tracker_script,
+    )
+    if not tracking_file:
+        fail("SpatialTracker failed")
+
+    # 4) TOF download
+    print("\n📥 Downloading TOF .npy files ...")
+    downloaded = download_all_npy_from_nextcloud_folder(
+        share_folder_url=tof_share_url,
+        target_dir=str(dirs["tof"]),
+        password=args.tof_share_password,
+    )
+    if downloaded <= 0:
+        fail("No TOF .npy files downloaded")
+
+    # 5) Analysis
+    print("\n📊 Running analysis ...")
+    analyze_results(
+        tracking_file=tracking_file,
+        tof_data_folder=str(dirs["tof"]),
+        output_dir=str(dirs["analysis"]),
+    )
+
+    # 6) Overlay TOF
+    print("\n🎥 Building TOF overlay video ...")
+    overlay_fps = probe_video_fps(h264_video) or 30.0
+    overlay_out = dirs["overlay"] / f"{Path(video_filename).stem}_tof_overlay.mp4"
+    info = create_tof_overlay_video(
+        tracking_file=tracking_file,
+        tof_data_folder=str(dirs["tof"]),
+        out_path=str(overlay_out),
+        fps=overlay_fps,
+        mask_path=mask_path,
+        colormap="turbo",
+        percentiles=(1, 99),
+        mask_zero=True,
+        global_norm=True,
+        point_radius=4,
+        point_thickness=-1,
+        draw_ids=False,
+        tail_length=10,
+        h264_crf=23,
+        h264_preset="slow",
+    )
+    print("✔️ Overlay:", info.get("final_out_path"))
+
+    print(f"\n✅ Done. Run folder: {dirs['run']}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+======================================================================
+Dateiname:      __init__.py
+Relativer Pfad: __init__.py
+----------------------------------------------------------------------
+from .video_io import download_and_ensure_h264
+from .masking import create_semantic_mask
+from .tracker import run_spatial_tracker
+from .tof_download import download_all_npy_from_nextcloud_folder
+from .analysis import analyze_results
+from .tof_overlay import create_tof_overlay_video, probe_video_fps
+
+__all__ = [
+    "download_and_ensure_h264",
+    "create_semantic_mask",
+    "run_spatial_tracker",
+    "download_all_npy_from_nextcloud_folder",
+    "analyze_results",
+    "create_tof_overlay_video",
+    "probe_video_fps",
+]
+
+
+======================================================================
+Dateiname:      analysis.py
+Relativer Pfad: analysis.py
+----------------------------------------------------------------------
+from __future__ import annotations
+import csv
+import json
+import os
+from typing import Optional, Tuple, Deque, List
+from collections import deque
+
+import numpy as np
+from tqdm import tqdm
+import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+def _robust_local_depth(depth: np.ndarray, x: int, y: int, win: int = 2) -> float:
+    h, w = depth.shape
+    x0, x1 = max(0, x - win), min(w, x + win + 1)
+    y0, y1 = max(0, y - win), min(h, y + win + 1)
+    patch = depth[y0:y1, x0:x1]
+    vals = patch[(patch > 0) & np.isfinite(patch)]
+    return float(np.median(vals)) if vals.size else 0.0
+
+def _mad(vals: np.ndarray, med: float) -> float:
+    if vals.size == 0:
+        return 0.0
+    return float(np.median(np.abs(vals - med)))
+
+def _load_and_check_tracking(tracking_file: str):
+    data = np.load(tracking_file, allow_pickle=True).item()
+    tracks_xy = data["tracks_xy_processed"]  # (F,P,2)
+    visibility = data["visibility"]          # (F,P)
+    H_proc, W_proc = data["video_size_processed_hw"]
+    return tracks_xy, visibility, (H_proc, W_proc)
+
+def _collect_tof_files(folder: str) -> list[str]:
+    return sorted(
+        f for f in (os.path.join(folder, x) for x in os.listdir(folder))
+        if f.endswith(".npy")
+    )
+
+def _plot_correct_incorrect_over_time(
+    frames: List[int],
+    correct: List[int],
+    visible: List[int],
+    out_png: str,
+    out_svg: Optional[str] = None,
+) -> None:
+    """Save a line chart: correct vs. incorrect points over time."""
+    incorrect = [v - c for v, c in zip(visible, correct)]
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(frames, correct, label="Correct points")
+    plt.plot(frames, incorrect, label="Incorrect points")
+    plt.xlabel("Frame")
+    plt.ylabel("# Points")
+    plt.title("Tracked Points Over Time (Correct vs. Incorrect)")
+    plt.grid(True, linewidth=0.5, alpha=0.6)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    if out_svg:
+        plt.savefig(out_svg)
+    plt.close()
+
+def analyze_results(
+    tracking_file: str,
+    tof_data_folder: str,
+    visibility_threshold: float = 0.5,  # kept for compatibility, not used directly now
+    output_dir: Optional[str] = None,
+) -> None:
+    """
+    Depth-aware analysis consistent with overlay logic.
+    Writes:
+      - metrics_summary.json
+      - metrics_per_frame.csv
+      - accuracy_over_time.png (and .svg)
+    """
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    print("\n📊 Analysis: loading tracking and TOF data ...")
+
+    try:
+        tracks_xy, visibility, (H_proc, W_proc) = _load_and_check_tracking(tracking_file)
+        F, P, _ = tracks_xy.shape
+        print(f"Tracker loaded: {F} frames, {P} points, @{W_proc}x{H_proc}.")
+    except Exception as e:
+        print(f"❌ Failed to load tracking file '{tracking_file}': {e}")
+        return
+
+    tof_files = _collect_tof_files(tof_data_folder)
+    if not tof_files:
+        print(f"❌ No .npy files found in TOF folder: {tof_data_folder}")
+        return
+
+    # Determine TOF size & scaling
+    first = np.load(tof_files[0])
+    if first.ndim == 3 and first.shape[-1] == 1:
+        first = first[..., 0]
+    H_tof, W_tof = first.shape
+    sx, sy = W_tof / W_proc, H_tof / H_proc
+
+    # Depth band EMA state (no mask used here to keep analysis independent)
+    ema_med: Optional[float] = None
+    ema_mad: Optional[float] = None
+    ema_alpha = 0.3
+    k = 2.5
+
+    per_frame_rows = []
+    total_visible = 0
+    total_correct = 0
+
+    hist_len = 5
+    # per-point temporal buffers for smoothing (match overlay behavior)
+    decide_bufs: List[Deque[bool]] = [deque(maxlen=hist_len) for _ in range(P)]
+
+    frames_idx: List[int] = []
+    frames_visible: List[int] = []
+    frames_correct: List[int] = []
+
+    print(f"Comparing {min(F, len(tof_files))} frames ...")
+    for t in tqdm(range(min(F, len(tof_files))), desc="Frame analysis"):
+        depth = np.load(tof_files[t])
+        if depth.ndim == 3 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+
+        # Estimate object depth band from points' local depth this frame (robust)
+        vis_mask = (visibility[t] > 0)
+        zs = []
+        for pid in np.where(vis_mask)[0]:
+            px, py = tracks_xy[t, pid]
+            x_tof = int(round(px * sx))
+            y_tof = int(round(py * sy))
+            if 0 <= x_tof < W_tof and 0 <= y_tof < H_tof:
+                z = _robust_local_depth(depth, x_tof, y_tof, win=2)
+                if z > 0:
+                    zs.append(z)
+        if zs:
+            zs = np.array(zs, dtype=np.float32)
+            med = float(np.median(zs))
+            mad = _mad(zs, med)
+            ema_med = med if ema_med is None else (1 - ema_alpha) * ema_med + ema_alpha * med
+            ema_mad = mad if ema_mad is None else (1 - ema_alpha) * ema_mad + ema_alpha * mad
+
+        if ema_med is None:
+            nz = depth[(depth > 0) & np.isfinite(depth)]
+            ema_med = float(np.median(nz)) if nz.size else 1.5
+        if ema_mad is None:
+            ema_mad = 0.08
+
+        band_lo = ema_med - max(0.06, k * ema_mad)
+        band_hi = ema_med + max(0.06, k * ema_mad)
+
+        visible_pts = int(np.sum(vis_mask))
+        total_visible += visible_pts
+        correct_pts = 0
+
+        for pid in np.where(vis_mask)[0]:
+            px, py = tracks_xy[t, pid]
+            x_tof = int(round(px * sx))
+            y_tof = int(round(py * sy))
+            correct_now = False
+            if 0 <= x_tof < W_tof and 0 <= y_tof < H_tof:
+                z = _robust_local_depth(depth, x_tof, y_tof, win=2)
+                if z > 0 and band_lo <= z <= band_hi:
+                    correct_now = True
+
+            decide_bufs[pid].append(correct_now)
+            # temporal majority smoothing
+            recent = decide_bufs[pid]
+            if sum(recent) > len(recent) // 2:
+                correct_pts += 1
+
+        total_correct += correct_pts
+        acc = (100.0 * correct_pts / max(1, visible_pts))
+
+        per_frame_rows.append({
+            "frame": t,
+            "visible_points": visible_pts,
+            "correct_points": correct_pts,
+            "accuracy_percent": acc,
+            "band_lo": band_lo,
+            "band_hi": band_hi,
+            "band_med": ema_med,
+            "band_mad": ema_mad,
+        })
+
+        frames_idx.append(t)
+        frames_visible.append(visible_pts)
+        frames_correct.append(correct_pts)
+
+    overall_acc = (100.0 * total_correct / max(1, total_visible))
+    print("\n--- Summary (depth-aware) ---")
+    print(f"Frames analyzed: {len(per_frame_rows)}")
+    print(f"Visible points total: {total_visible}")
+    print(f"Correct points (smoothed): {total_correct}")
+    print(f"Average accuracy: {overall_acc:.2f}%")
+
+    if output_dir:
+        with open(os.path.join(output_dir, "metrics_summary.json"), "w") as f:
+            json.dump({
+                "frames_analyzed": len(per_frame_rows),
+                "visible_points_total": int(total_visible),
+                "correct_points_total": int(total_correct),
+                "average_accuracy_percent": float(overall_acc),
+            }, f, indent=2)
+
+        # Per-frame CSV
+        with open(os.path.join(output_dir, "metrics_per_frame.csv"), "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=[
+                "frame", "visible_points", "correct_points",
+                "accuracy_percent", "band_lo", "band_hi", "band_med", "band_mad"
+            ])
+            w.writeheader()
+            w.writerows(per_frame_rows)
+
+        # Plot: correct vs incorrect over time
+        png_path = os.path.join(output_dir, "accuracy_over_time.png")
+        svg_path = os.path.join(output_dir, "accuracy_over_time.svg")
+        _plot_correct_incorrect_over_time(frames_idx, frames_correct, frames_visible, png_path, svg_path)
+        print(f"Saved plot: {png_path}")
+
+
+
+======================================================================
+Dateiname:      masking.py
+Relativer Pfad: masking.py
+----------------------------------------------------------------------
+from __future__ import annotations
+import os
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+
+import clip
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+
+
+def _load_first_frame(video_path: str) -> np.ndarray:
+    cap = cv2.VideoCapture(video_path)
+    ok, frame_bgr = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError(f"Could not read first frame from: {video_path}")
+    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+
+def _crop_with_mask(image_rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    x, y, w, h = cv2.boundingRect(mask.astype(np.uint8))
+    return image_rgb[y:y + h, x:x + w]
+
+
+def _encode_image(model, preprocess, image_rgb: np.ndarray, device: str) -> torch.Tensor:
+    image_pil = Image.fromarray(image_rgb)
+    image_input = preprocess(image_pil).unsqueeze(0).to(device)
+    with torch.no_grad():
+        return model.encode_image(image_input).float()
+
+
+def _encode_text(model, prompts: List[str], device: str) -> torch.Tensor:
+    with torch.no_grad():
+        tokens = clip.tokenize(prompts).to(device)
+        return model.encode_text(tokens).float()  # (N, D)
+
+
+def _colored_segmentation(image_shape: Tuple[int, int, int], masks: List[dict]) -> np.ndarray:
+    h, w = image_shape[:2]
+    vis = np.zeros((h, w, 3), dtype=np.uint8)
+    for i, m in enumerate(masks):
+        seg = m["segmentation"]
+        color = [(i * 37) % 256, (i * 59) % 256, (i * 83) % 256]
+        vis[seg] = color
+    return vis
+
+
+def _circularity_score(mask: np.ndarray) -> float:
+    """Return [0..1], 1 is perfect circle (using 4πA / P^2)."""
+    m8 = mask.astype(np.uint8)
+    cnts, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return 0.0
+    c = max(cnts, key=cv2.contourArea)
+    area = float(cv2.contourArea(c))
+    per = float(cv2.arcLength(c, True) + 1e-6)
+    circ = (4.0 * np.pi * area) / (per * per)
+    # clamp to [0,1]
+    return float(max(0.0, min(1.0, circ)))
+
+
+def create_semantic_mask(
+    video_path: str,
+    output_folder: str,
+    reference_images_dir: str,
+    sam_checkpoint: str,
+    model_type: str = "vit_h",
+    device: str = "cuda",
+    use_center_priority: bool = False,
+    target_class: Optional[str] = None,
+    disallow_classes: Optional[List[str]] = None,
+    enforce_circularity: bool = False,
+) -> Optional[str]:
+    """
+    Generate a segmentation mask from the first frame using SAM.
+    Segment selection:
+      - If center priority: choose segment closest to center.
+      - Else: CLIP scoring with (a) image references, (b) optional text bias toward `target_class`,
+              and (c) optional negative class penalty via text prompts.
+      - Optional geometric prior to prefer circular shapes (for balls).
+
+    Saves:
+      - *_all_segments.png
+      - *_best_mask.png
+      - *_best_visualization.png
+
+    Returns: path to *_best_mask.png or None on failure.
+    """
+    os.makedirs(output_folder, exist_ok=True)
+
+    frame_rgb = _load_first_frame(video_path)
+    H, W = frame_rgb.shape[:2]
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+
+    # --- SAM ---
+    sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+    sam.to(device=device)
+    mask_gen = SamAutomaticMaskGenerator(
+        sam,
+        points_per_side=32,
+        pred_iou_thresh=0.9,
+        stability_score_thresh=0.92,
+        min_mask_region_area=2000,
+        crop_n_layers=1,
+        crop_n_points_downscale_factor=2,
+    )
+
+    print("Generating SAM segments ...")
+    masks = mask_gen.generate(frame_rgb)
+    all_vis = _colored_segmentation(frame_rgb.shape, masks)
+    cv2.imwrite(os.path.join(output_folder, f"{stem}_all_segments.png"),
+                cv2.cvtColor(all_vis, cv2.COLOR_RGB2BGR))
+
+    if not masks:
+        print("No SAM segments found.")
+        return None
+
+    # --- CLIP ---
+    clip_model, preprocess = clip.load("ViT-B/32", device=device)
+
+    # Image reference embeddings
+    ref_embeds: list[torch.Tensor] = []
+    if not use_center_priority:
+        if not os.path.isdir(reference_images_dir):
+            print(f"Reference images directory not found: {reference_images_dir}")
+            return None
+        for fname in sorted(os.listdir(reference_images_dir)):
+            if fname.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
+                path = os.path.join(reference_images_dir, fname)
+                img = np.array(Image.open(path).convert("RGB"))
+                ref_embeds.append(_encode_image(clip_model, preprocess, img, device))
+        if not ref_embeds:
+            print(f"No reference images found in: {reference_images_dir}")
+            return None
+
+    # Text guidance
+    text_pos = _encode_text(clip_model, [target_class], device) if target_class else None
+    text_neg = _encode_text(clip_model, disallow_classes, device) if disallow_classes else None
+
+    # --- rank segments ---
+    cx, cy = W / 2.0, H / 2.0
+    ranked = []
+
+    with torch.no_grad():
+        for i, m in enumerate(masks):
+            seg = m["segmentation"]
+            ys, xs = np.where(seg)
+            if xs.size == 0:
+                continue
+
+            # Base crop embedding
+            crop = _crop_with_mask(frame_rgb, seg)
+            emb = _encode_image(clip_model, preprocess, crop, device)  # (1, D)
+
+            score = 0.0
+
+            # (a) image refs (max cosine similarity)
+            if ref_embeds and not use_center_priority:
+                sim_img = torch.stack([
+                    torch.nn.functional.cosine_similarity(emb, r, dim=1)[0] for r in ref_embeds
+                ]).max().item()
+                score += 1.0 * float(sim_img)
+
+            # (b) text positive bias
+            if text_pos is not None:
+                sim_pos = torch.nn.functional.cosine_similarity(emb, text_pos, dim=1)[0].item()
+                score += 0.7 * float(sim_pos)
+
+            # (c) text negative penalty (use the worst offender)
+            if text_neg is not None:
+                sim_neg = torch.nn.functional.cosine_similarity(emb, text_neg, dim=1)  # (K,)
+                penalty = sim_neg.max().item()
+                score -= 0.7 * float(penalty)
+
+            # (d) geometric prior: prefer near-circular (gym ball-like)
+            if enforce_circularity:
+                circ = _circularity_score(seg.astype(np.uint8))
+                area = float(seg.sum())
+                area_norm = area / float(H * W)
+                score += 0.5 * circ + 0.2 * area_norm  # mild bias
+
+            # (e) optional center proximity (very small tie-breaker)
+            centroid = (float(xs.mean()), float(ys.mean()))
+            dist = np.hypot(centroid[0] - cx, centroid[1] - cy)
+            score += -0.0005 * dist  # tiny nudge toward center
+
+            ranked.append({"idx": i, "mask": seg, "score": score})
+
+    if not ranked:
+        print("No valid segments after scoring.")
+        return None
+
+    ranked.sort(key=lambda d: d["score"], reverse=True)
+    best = ranked[0]["mask"].astype(bool)
+
+    # Save outputs
+    mask_out = (best.astype(np.uint8) * 255)
+    overlay = frame_rgb.copy()
+    overlay[best] = [0, 255, 0]
+    vis = (0.7 * frame_rgb + 0.3 * overlay).astype(np.uint8)
+
+    mask_path = os.path.join(output_folder, f"{stem}_best_mask.png")
+    vis_path = os.path.join(output_folder, f"{stem}_best_visualization.png")
+
+    cv2.imwrite(mask_path, mask_out)
+    cv2.imwrite(vis_path, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
+    print(f"Selected segment saved -> {mask_path}")
+    return mask_path
+
+
+
+======================================================================
+Dateiname:      tof_download.py
+Relativer Pfad: tof_download.py
+----------------------------------------------------------------------
+import os
+import xml.etree.ElementTree as ET
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+import requests
+from tqdm import tqdm
+
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+}
+
+
+def _parse_share_url(share_url: str) -> Tuple[str, str, str]:
+    """
+    Splits a Nextcloud public share folder URL into (base_url, token, path_in_share).
+    Expected shape: https://<host>/s/<TOKEN>?path=/some/folder
+    """
+    u = urlparse(share_url)
+    base_url = f"{u.scheme}://{u.netloc}"
+    parts = [p for p in u.path.split("/") if p]
+
+    token = ""
+    for i, p in enumerate(parts):
+        if p == "s" and i + 1 < len(parts):
+            token = parts[i + 1]
+            break
+    if not token:
+        raise ValueError("Could not infer share token from URL (expected .../s/<token>).")
+
+    q = parse_qs(u.query)
+    path_in_share = q.get("path", ["/"])[0] or "/"
+    if not path_in_share.startswith("/"):
+        path_in_share = "/" + path_in_share
+    return base_url, token, path_in_share
+
+
+def _webdav_list_npy(
+    base_url: str,
+    token: str,
+    password: str,
+    path_in_share: str,
+    session: requests.Session,
+) -> List[Dict[str, Optional[str]]]:
+    """
+    Lists .npy files (non-recursive) in the given share path via WebDAV (Depth: 1).
+    Returns a list of dicts: {"href": str, "name": str, "size": Optional[int]}
+    """
+    webdav_base = f"{base_url}/public.php/webdav"
+    target_url = f"{webdav_base}{quote(path_in_share, safe='/%')}"
+
+    body = """<?xml version="1.0" encoding="utf-8" ?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:resourcetype/>
+    <d:getcontentlength/>
+    <d:getlastmodified/>
+    <d:getcontenttype/>
+  </d:prop>
+</d:propfind>""".strip()
+
+    headers = {**_HEADERS, "Depth": "1", "Content-Type": "text/xml; charset=utf-8"}
+    auth = requests.auth.HTTPBasicAuth(token, password or "")
+
+    r = session.request("PROPFIND", target_url, headers=headers, data=body, auth=auth, timeout=30)
+    if r.status_code != 207:
+        raise RuntimeError(f"WebDAV PROPFIND failed: HTTP {r.status_code} - {r.text[:200]}")
+
+    ns = {"d": "DAV:"}
+    root = ET.fromstring(r.text)
+
+    files: List[Dict[str, Optional[str]]] = []
+    for resp in root.findall("d:response", ns):
+        href_el = resp.find("d:href", ns)
+        if href_el is None:
+            continue
+        href = href_el.text or ""
+        href_decoded = unquote(href)
+
+        propstat = resp.find("d:propstat", ns)
+        if propstat is None:
+            continue
+        prop = propstat.find("d:prop", ns)
+        if prop is None:
+            continue
+
+        rtype = prop.find("d:resourcetype", ns)
+        is_collection = False
+        if rtype is not None and list(rtype):
+            is_collection = any(child.tag.endswith("collection") for child in rtype)
+        if is_collection:
+            continue  # only files
+
+        name = os.path.basename(href_decoded.rstrip("/"))
+        if not name.lower().endswith(".npy"):
+            continue
+
+        size_el = prop.find("d:getcontentlength", ns)
+        size_val: Optional[int] = None
+        if size_el is not None and size_el.text and size_el.text.isdigit():
+            size_val = int(size_el.text)
+
+        if href.startswith("/"):
+            download_url = f"{base_url}{href}"
+        else:
+            download_url = f"{webdav_base}/{name}"
+
+        files.append({"href": download_url, "name": name, "size": size_val})
+
+    return files
+
+
+def download_all_npy_from_nextcloud_folder(
+    share_folder_url: str, target_dir: str, password: str = ""
+) -> int:
+    """
+    Downloads all .npy files from the given Nextcloud public share folder URL into `target_dir`.
+    Returns the number of files successfully downloaded or already present.
+    """
+    os.makedirs(target_dir, exist_ok=True)
+    base_url, token, path_in_share = _parse_share_url(share_folder_url)
+
+    with requests.Session() as s:
+        try:
+            listing = _webdav_list_npy(base_url, token, password, path_in_share, s)
+        except Exception as e:
+            print(f"❌ Failed to fetch .npy listing: {e}")
+            return 0
+
+        if not listing:
+            print("❗ No .npy files found in the specified folder.")
+            return 0
+
+        print(f"🔎 Found .npy files: {len(listing)}")
+        ok = 0
+        auth = requests.auth.HTTPBasicAuth(token, password or "")
+
+        for item in listing:
+            url = item["href"]
+            fname = item["name"]
+            expected_size = item["size"]
+            out_path = os.path.join(target_dir, fname)
+
+            if os.path.exists(out_path):
+                if expected_size is not None and os.path.getsize(out_path) == expected_size:
+                    print(f"[=] Skipping (already exists, size matches): {fname}")
+                    ok += 1
+                    continue
+                else:
+                    print(f"[~] File exists but size differs/unknown: {fname} -> re-downloading")
+
+            try:
+                with s.get(url, headers=_HEADERS, stream=True, timeout=120, auth=auth) as resp:
+                    resp.raise_for_status()
+                    total = int(resp.headers.get("content-length", 0))
+                    with open(out_path, "wb") as f, tqdm(
+                        desc=fname,
+                        total=total or expected_size or None,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        leave=False,
+                    ) as bar:
+                        for chunk in resp.iter_content(chunk_size=1024 * 256):
+                            if chunk:
+                                f.write(chunk)
+                                bar.update(len(chunk))
+                print(f"[✓] Saved: {out_path}")
+                ok += 1
+            except Exception as e:
+                print(f"[x] Download error for '{fname}': {e}")
+
+        print(f"📁 Done: {ok}/{len(listing)} .npy files in '{target_dir}'")
+        return ok
+
+
+
+======================================================================
+Dateiname:      tof_overlay.py
+Relativer Pfad: tof_overlay.py
+----------------------------------------------------------------------
+"""
+Create an H.264 MP4 where SpatialTracker points are drawn on top of TOF depth frames.
+
+- Coordinates are mapped from processed video space → TOF space.
+- First-frame mask is warped to each frame via homography estimated from tracks that
+  started inside the mask and are visible in both t=0 and t (geometric prior).
+- The warped mask is slightly dilated to be lenient to small warp errors.
+- A per-frame object depth band is learned from TOF depths inside the warped mask and
+  smoothed with an EMA; points are also validated by a robust local median depth.
+- Temporal smoothing (majority vote over recent frames) prevents flicker.
+
+A point is green if (in warped+dilated mask) OR (local depth within depth band).
+Otherwise it’s red. Optionally, if the tracker marks a point invisible and TOF has
+no return locally, it’s drawn yellow.
+
+Returned dict:
+{
+    'frames_written', 'size', 'vmin', 'vmax', 'fps',
+    'raw_out_path', 'final_out_path'
+}
+"""
+
+from __future__ import annotations
+import os
+from typing import Dict, List, Optional, Tuple, Deque
+from collections import deque
+
+import numpy as np
+import cv2
+
+from .tof_to_mp4 import (
+    list_npy_files,
+    compute_norm_bounds,
+    normalize_to_uint8,
+    to_bgr,
+    ensure_h264,
+)
+
+# ---------------------- helpers ----------------------
+
+def _natural_sort(files: List[str]) -> List[str]:
+    """Sort files naturally (e.g., frame1, frame2, ..., frame10)."""
+    return sorted(files, key=lambda x: int(''.join(filter(str.isdigit, x)) or 0))
+
+def probe_video_fps(video_path: str) -> Optional[float]:
+    """Try to read FPS from a (H.264) video using OpenCV. Returns None if not available."""
+    cap = cv2.VideoCapture(video_path)
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps and fps > 1e-3 and np.isfinite(fps):
+            return float(fps)
+        return None
+    finally:
+        cap.release()
+
+def _load_mask_resized(mask_path: str, target_hw: Tuple[int, int]) -> np.ndarray:
+    """Load binary mask (0/255) and resize to (H_proc, W_proc) using nearest neighbor; return 0/1 mask."""
+    m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        raise FileNotFoundError(f"Mask image not found or unreadable: {mask_path}")
+    Ht, Wt = target_hw
+    m = cv2.resize(m, (Wt, Ht), interpolation=cv2.INTER_NEAREST)
+    return (m > 127).astype(np.uint8)  # 0/1
+
+def _estimate_homography(p0: np.ndarray, p1: np.ndarray) -> np.ndarray:
+    """Robust homography with RANSAC; identity if not enough inliers."""
+    if p0.shape[0] >= 4 and p1.shape[0] >= 4:
+        H, _ = cv2.findHomography(
+            p0, p1,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=3.0,
+            maxIters=2000,
+            confidence=0.995
+        )
+        if H is not None:
+            return H
+    return np.eye(3, dtype=np.float64)
+
+def _robust_local_depth(depth: np.ndarray, x: int, y: int, win: int = 2) -> float:
+    """
+    Median depth in a (2*win+1)^2 window around (x, y), ignoring 0 (no return).
+    Returns 0 if no valid samples.
+    """
+    h, w = depth.shape
+    x0, x1 = max(0, x - win), min(w, x + win + 1)
+    y0, y1 = max(0, y - win), min(h, y + win + 1)
+    patch = depth[y0:y1, x0:x1]
+    vals = patch[(patch > 0) & np.isfinite(patch)]
+    return float(np.median(vals)) if vals.size else 0.0
+
+def _mad(vals: np.ndarray, med: float) -> float:
+    """Median absolute deviation."""
+    if vals.size == 0:
+        return 0.0
+    return float(np.median(np.abs(vals - med)))
+
+# ---------------------- core ----------------------
+
+def create_tof_overlay_video(
+    tracking_file: str,
+    tof_data_folder: str,
+    out_path: Optional[str] = None,
+    out_dir: Optional[str] = None,
+    out_name: str = "tof_overlay.mp4",
+    fps: float = 30.0,
+    pattern: str = "*.npy",
+    # depth visualization:
+    colormap: str = "turbo",
+    percentiles: Optional[Tuple[float, float]] = (1.0, 99.0),
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    mask_zero: bool = True,
+    global_norm: bool = True,
+    global_samples: int = 50,
+    # first-frame object mask (PNG from step 2)
+    mask_path: Optional[str] = None,
+    # drawing
+    point_radius: int = 4,
+    point_thickness: int = -1,
+    draw_ids: bool = False,
+    font_scale: float = 0.4,
+    font_thickness: int = 1,
+    tail_length: int = 0,
+    on_color: Tuple[int,int,int] = (0,255,0),   # green (BGR)
+    off_color: Tuple[int,int,int] = (0,0,255),  # red (BGR)
+    unsure_color: Tuple[int,int,int] = (0,255,255),  # yellow (BGR)
+    # encoding:
+    raw_suffix: str = "_raw_overlay.mp4",
+    h264_crf: int = 23,
+    h264_preset: str = "slow",
+) -> Dict[str, object]:
+    """
+    Build a TOF overlay video: TOF depth background + SpatialTracker points with robust correctness.
+
+    Returns a dict with fields:
+      { 'frames_written', 'size', 'vmin', 'vmax', 'fps', 'raw_out_path', 'final_out_path' }
+    """
+
+    # ---- load tracking ----
+    tdata = np.load(tracking_file, allow_pickle=True).item()
+    tracks_xy = tdata["tracks_xy_processed"]   # (F,P,2) in processed coords
+    visibility = tdata["visibility"]           # (F,P)
+    H_proc, W_proc = tdata["video_size_processed_hw"]
+
+    # ---- TOF files ----
+    tof_files = list_npy_files(tof_data_folder, pattern)
+    if not tof_files:
+        raise FileNotFoundError(f"No .npy found in '{tof_data_folder}' with pattern '{pattern}'.")
+
+    # ---- output paths ----
+    if out_path:
+        final_out = out_path
+    else:
+        base_dir = out_dir if out_dir else tof_data_folder
+        os.makedirs(base_dir, exist_ok=True)
+        final_out = os.path.join(base_dir, out_name)
+    raw_out = final_out.replace(".mp4", raw_suffix)
+
+    # ---- TOF size ----
+    first = np.load(tof_files[0], allow_pickle=False)
+    if first.ndim == 3 and first.shape[-1] == 1:
+        first = first[..., 0]
+    if first.ndim != 2:
+        raise ValueError(f"Unexpected TOF array shape {first.shape} in {tof_files[0]}.")
+    H_tof, W_tof = first.shape[:2]
+    frame_size = (W_tof, H_tof)
+
+    # ---- normalization (for background visualization only) ----
+    gvmin, gvmax = vmin, vmax
+    if global_norm and (gvmin is None or gvmax is None):
+        idxs = np.linspace(0, len(tof_files) - 1, num=min(global_samples, len(tof_files)), dtype=int)
+        sample_arrays = []
+        for p in [tof_files[i] for i in idxs]:
+            a = np.load(p, allow_pickle=False)
+            if a.ndim == 3 and a.shape[-1] == 1: a = a[..., 0]
+            if a.ndim != 2: raise ValueError(f"Unexpected array shape {a.shape} in {p}.")
+            sample_arrays.append(a)
+        gvmin, gvmax = compute_norm_bounds(sample_arrays, vmin, vmax, percentiles, mask_zero)
+
+    # ---- writer ----
+    writer = cv2.VideoWriter(raw_out, cv2.VideoWriter_fourcc(*"mp4v"), fps, frame_size, True)
+    if not writer.isOpened():
+        raise RuntimeError("Could not open VideoWriter for raw overlay video (mp4v).")
+
+    # ---- prepare first-frame mask (processed size) ----
+    mask_proc: Optional[np.ndarray] = None
+    if mask_path:
+        mask_proc = _load_mask_resized(mask_path, (H_proc, W_proc))  # 0/1 uint8
+
+    F, P, _ = tracks_xy.shape
+    num_frames = min(len(tof_files), F)
+    scale_x = W_tof / float(W_proc)
+    scale_y = H_tof / float(H_proc)
+
+    # Homography (mask warp) state
+    H_prev = np.eye(3, dtype=np.float64)
+    valid0 = (visibility[0] > 0)
+
+    # Per-point membership of the t=0 point in the initial mask (used to seed homography)
+    in_mask0 = np.zeros(P, dtype=bool)
+    if mask_proc is not None:
+        for pid in range(P):
+            if not valid0[pid]:
+                continue
+            x0, y0 = tracks_xy[0, pid]
+            ix0, iy0 = int(round(x0)), int(round(y0))
+            if 0 <= ix0 < W_proc and 0 <= iy0 < H_proc:
+                in_mask0[pid] = bool(mask_proc[iy0, ix0])
+
+    # Per-point trails and decision smoothing buffer
+    tails: List[List[Tuple[int,int]]] = [[] for _ in range(P)]
+    hist_len = 5  # temporal smoothing window
+    decide_bufs: List[Deque[bool]] = [deque(maxlen=hist_len) for _ in range(P)]
+
+    # Depth band EMA state
+    ema_med: Optional[float] = None
+    ema_mad: Optional[float] = None
+    ema_alpha = 0.3  # 0..1
+
+    # ---- main loop ----
+    frames_written = 0
+    for t in range(num_frames):
+        depth = np.load(tof_files[t], allow_pickle=False)
+        if depth.ndim == 3 and depth.shape[-1] == 1: depth = depth[..., 0]
+        if depth.ndim != 2: raise ValueError(f"Unexpected array shape {depth.shape} in {tof_files[t]}.")
+
+        # Background image (visualization only)
+        if not global_norm and (vmin is None or vmax is None):
+            vmin_f, vmax_f = compute_norm_bounds([depth], None, None, percentiles, mask_zero)
+        else:
+            vmin_f, vmax_f = gvmin, gvmax
+        img_u8 = normalize_to_uint8(depth, float(vmin_f), float(vmax_f), mask_zero)
+        frame_bgr = to_bgr(img_u8, colormap)
+
+        # ---- warp first-frame mask to frame t (processed coords) ----
+        mask_t_bool = None
+        if mask_proc is not None:
+            # Use tracks that were visible at t=0, are visible at t, and started inside the mask
+            both_vis = (visibility[0] > 0) & (visibility[t] > 0) & in_mask0  # (P,)
+
+            p0_list, p1_list = [], []
+            for pid in np.where(both_vis)[0]:
+                x0, y0 = tracks_xy[0, pid]
+                xt, yt = tracks_xy[t, pid]
+                p0_list.append([x0, y0])
+                p1_list.append([xt, yt])
+
+            if len(p0_list) >= 4:
+                p0 = np.array(p0_list, dtype=np.float32)
+                p1 = np.array(p1_list, dtype=np.float32)
+                H_t = _estimate_homography(p0, p1)
+                H_prev = H_t  # keep the latest good homography
+            H_comb = H_prev
+
+            mask_t = cv2.warpPerspective(
+                (mask_proc * 255).astype(np.uint8),
+                H_comb,
+                (W_proc, H_proc),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            # small dilation → be lenient to warp errors
+            kernel = np.ones((5, 5), np.uint8)
+            mask_t = cv2.dilate(mask_t, kernel, iterations=1)
+            mask_t_bool = (mask_t > 127)
+
+        # ---- learn per-frame object depth band from warped mask ----
+        med_band, mad_band = None, None
+        if mask_t_bool is not None:
+            ys, xs = np.where(mask_t_bool)
+            if xs.size:
+                xs_tof = np.clip((xs * scale_x).round().astype(int), 0, W_tof - 1)
+                ys_tof = np.clip((ys * scale_y).round().astype(int), 0, H_tof - 1)
+                samples = depth[ys_tof, xs_tof]
+                samples = samples[(samples > 0) & np.isfinite(samples)]
+                if samples.size >= 50:  # need some mass
+                    med = float(np.median(samples))
+                    mad = _mad(samples, med)
+                    med_band, mad_band = med, max(mad, 0.03)  # minimum tolerance
+
+        # EMA smoothing / fallback
+        if med_band is not None:
+            ema_med = med_band if ema_med is None else (1.0 - ema_alpha) * ema_med + ema_alpha * med_band
+            ema_mad = mad_band if ema_mad is None else (1.0 - ema_alpha) * ema_mad + ema_alpha * mad_band
+        if ema_med is None:
+            # Bootstrap from scene depth if mask didn’t provide samples yet
+            nonzero = depth[(depth > 0) & np.isfinite(depth)]
+            ema_med = float(np.median(nonzero)) if nonzero.size else 1.5
+        if ema_mad is None:
+            ema_mad = 0.08  # ≈ 8 cm baseline tolerance
+
+        # Build depth band
+        k = 2.5
+        band_lo = ema_med - max(0.06, k * ema_mad)  # min total half-width ~6 cm
+        band_hi = ema_med + max(0.06, k * ema_mad)
+
+        # ---- draw points with robust correctness ----
+        vis = visibility[t] > 0
+        for pid in np.where(vis)[0]:
+            px, py = tracks_xy[t, pid]  # processed coords
+            ixp, iyp = int(round(px)), int(round(py))
+
+            # geometric membership (processed coords)
+            on_geom = False
+            if mask_t_bool is not None and 0 <= ixp < W_proc and 0 <= iyp < H_proc:
+                on_geom = bool(mask_t_bool[iyp, ixp])
+
+            # depth membership (TOF coords + local median)
+            x_tof = int(round(px * scale_x))
+            y_tof = int(round(py * scale_y))
+            in_bounds = (0 <= x_tof < W_tof and 0 <= y_tof < H_tof)
+
+            on_depth = False
+            if in_bounds:
+                local_depth = _robust_local_depth(depth, x_tof, y_tof, win=2)
+                if local_depth > 0:
+                    on_depth = (band_lo <= local_depth <= band_hi)
+
+            # decision (store into smoothing buffer)
+            correct_now = bool(on_geom or on_depth)
+            decide_bufs[pid].append(correct_now)
+
+            # temporal smoothing: majority of last N
+            recent = decide_bufs[pid]
+            correct = (sum(recent) > len(recent) // 2)
+
+            # choose color
+            color = on_color if correct else off_color
+
+            # draw (TOF coords)
+            if in_bounds:
+                cv2.circle(frame_bgr, (x_tof, y_tof), point_radius, color,
+                           thickness=point_thickness, lineType=cv2.LINE_AA)
+                if draw_ids:
+                    cv2.putText(frame_bgr, str(pid), (x_tof + 6, y_tof - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, font_scale, color,
+                                font_thickness, cv2.LINE_AA)
+
+                # trails in TOF coords
+                if tail_length > 0:
+                    trail = tails[pid]
+                    trail.append((x_tof, y_tof))
+                    if len(trail) > tail_length:
+                        trail.pop(0)
+                    if len(trail) >= 2:
+                        cv2.polylines(frame_bgr, [np.array(trail, dtype=np.int32)],
+                                      False, color, 1, cv2.LINE_AA)
+
+            # Optional: visualize uncertainty if tracker says invisible and TOF has no return nearby
+            if visibility[t, pid] == 0 and in_bounds:
+                if _robust_local_depth(depth, x_tof, y_tof, win=1) == 0.0:
+                    cv2.circle(frame_bgr, (x_tof, y_tof), point_radius, unsure_color,
+                               thickness=point_thickness, lineType=cv2.LINE_AA)
+
+        writer.write(frame_bgr)
+        frames_written += 1
+
+    writer.release()
+
+    ensured = ensure_h264(raw_out, output_path=final_out, crf=h264_crf, preset=h264_preset)
+
+    return {
+        "frames_written": frames_written,
+        "size": frame_size,
+        "vmin": float(gvmin) if gvmin is not None else None,
+        "vmax": float(gvmax) if gvmax is not None else None,
+        "fps": fps,
+        "raw_out_path": raw_out,
+        "final_out_path": ensured,
+    }
+
+
+
+======================================================================
+Dateiname:      tof_to_mp4.py
+Relativer Pfad: tof_to_mp4.py
+----------------------------------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+npy_to_mp4_module
+-----------------
+Turn a folder of `.npy` depth maps (e.g., TOF camera) into an MP4 and
+*ensure the final file is H.264* using ffprobe/ffmpeg — just like the pattern you shared.
+
+Key points
+- Robust, TOF-friendly normalization (percentiles + ignore zeros).
+- Attempts to write H.264 directly via OpenCV ('avc1'); if that's not available,
+  falls back to a widely supported writer (e.g., 'mp4v') and then converts to H.264
+  with ffmpeg (libx264), using ffprobe to detect the codec first.
+- You can provide an output directory and file name separately, or a full `out_path`.
+
+Dependencies
+- numpy, opencv-python
+- ffmpeg and ffprobe available on PATH (for codec probe/convert)
+"""
+from __future__ import annotations
+
+import glob
+import json
+import math
+import os
+import re
+import subprocess
+from typing import Callable, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+try:
+    import cv2  # type: ignore
+except Exception as e:
+    raise ImportError("OpenCV (cv2) is required. Install with: pip install opencv-python") from e
+
+
+# ---------------------- Utilities ----------------------
+
+def natural_key(s: str):
+    """Natural sort so that 'frame2' < 'frame10'."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def list_npy_files(input_dir: str, pattern: str = "*.npy") -> List[str]:
+    files = sorted(glob.glob(os.path.join(input_dir, pattern)), key=natural_key)
+    return [f for f in files if os.path.isfile(f)]
+
+
+def apply_geometric_ops(img: np.ndarray, rotate: int = 0, flip: str = "none") -> np.ndarray:
+    """Apply rotation (0/90/180/270) and optional flip ('h' or 'v')."""
+    if rotate not in (0, 90, 180, 270):
+        raise ValueError("rotate must be one of: 0, 90, 180, 270.")
+
+    if rotate == 90:
+        img = np.rot90(img, k=1)
+    elif rotate == 180:
+        img = np.rot90(img, k=2)
+    elif rotate == 270:
+        img = np.rot90(img, k=3)
+
+    if flip == "h":
+        img = np.fliplr(img)
+    elif flip == "v":
+        img = np.flipud(img)
+    elif flip not in ("none", "", None):
+        raise ValueError("flip must be 'h', 'v', or 'none'.")
+
+    return img
+
+
+def compute_norm_bounds(
+    sample_arrays: Sequence[np.ndarray],
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    percentiles: Optional[Tuple[float, float]] = (1.0, 99.0),
+    mask_zero: bool = True,
+) -> Tuple[float, float]:
+    """
+    Determine vmin/vmax either directly or via robust percentiles.
+    Ignores NaN/Inf; optionally ignores zeros (typical for 'no return' in TOF).
+    """
+    if vmin is not None and vmax is not None:
+        if not (vmax > vmin):
+            raise ValueError("vmax must be > vmin.")
+        return float(vmin), float(vmax)
+
+    values: List[np.ndarray] = []
+    target = 1_000_000  # collect up to ~1e6 values to limit memory
+    per_array_cap = max(10_000, target // max(1, len(sample_arrays)))
+
+    for arr in sample_arrays:
+        a = arr.astype(np.float32, copy=False)
+        valid = np.isfinite(a)
+        if mask_zero:
+            valid &= (a != 0)
+        a = a[valid]
+        if a.size == 0:
+            continue
+        if a.size > per_array_cap:
+            # downsample randomly to reduce memory
+            idx = np.random.default_rng(42).choice(a.size, size=per_array_cap, replace=False)
+            a = a[idx]
+        values.append(a)
+
+    if not values:
+        return 0.0, 1.0
+
+    vals = np.concatenate(values, axis=0)
+
+    if percentiles is not None:
+        lo, hi = percentiles
+        vmin_est = float(np.percentile(vals, lo))
+        vmax_est = float(np.percentile(vals, hi))
+    else:
+        vmin_est = float(np.min(vals))
+        vmax_est = float(np.max(vals))
+
+    if not math.isfinite(vmin_est) or not math.isfinite(vmax_est) or vmax_est <= vmin_est:
+        return 0.0, 1.0
+    return vmin_est, vmax_est
+
+
+def normalize_to_uint8(arr: np.ndarray, vmin: float, vmax: float, mask_zero: bool = True) -> np.ndarray:
+    """Linearly scale arr to [0, 255] (uint8) using vmin/vmax, robust to zeros/NaN/Inf."""
+    a = arr.astype(np.float32, copy=False)
+
+    valid = np.isfinite(a)
+    if mask_zero:
+        valid &= (a != 0)
+
+    out = np.zeros_like(a, dtype=np.uint8)
+    if not np.any(valid):
+        return out
+
+    a = np.clip(a, vmin, vmax, out=a)
+    scale = 255.0 / max(1e-12, (vmax - vmin))
+    out_valid = ((a[valid] - vmin) * scale)
+    out[valid] = np.clip(np.rint(out_valid), 0, 255).astype(np.uint8)
+    return out
+
+
+def to_bgr(img_u8: np.ndarray, colormap: str = "turbo") -> np.ndarray:
+    """
+    Map a single-channel uint8 image to 3-channel BGR for the VideoWriter.
+    colormap: 'none', 'gray', 'turbo', 'viridis', 'plasma', 'magma', 'inferno', 'jet'
+    """
+    cmap_map = {
+        "none": None,
+        "gray": None,  # we convert to 3-channel gray
+        "turbo": cv2.COLORMAP_TURBO,
+        "viridis": cv2.COLORMAP_VIRIDIS,
+        "plasma": cv2.COLORMAP_PLASMA,
+        "magma": cv2.COLORMAP_MAGMA,
+        "inferno": cv2.COLORMAP_INFERNO,
+        "jet": cv2.COLORMAP_JET,
+    }
+    c = cmap_map.get(colormap.lower(), None)
+    if c is None:
+        return cv2.cvtColor(img_u8, cv2.COLOR_GRAY2BGR)
+    return cv2.applyColorMap(img_u8, c)
+
+
+def _resolve_out_path(
+    out_path: Optional[str],
+    out_dir: Optional[str],
+    out_name: str,
+    default_dir: str,
+) -> str:
+    """
+    Resolve the final output path.
+    Priority:
+      1) explicit out_path (returned as-is),
+      2) join(out_dir, out_name) if out_dir is given,
+      3) join(default_dir, out_name).
+    Ensures the parent directory exists.
+    """
+    if out_path:
+        final = out_path
+    else:
+        base_dir = out_dir if out_dir else default_dir
+        final = os.path.join(base_dir, out_name)
+
+    os.makedirs(os.path.dirname(final), exist_ok=True)
+    return final
+
+
+# ---------------------- ffprobe/ffmpeg helpers ----------------------
+
+def _run(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+
+def probe_video_codec(filepath: str) -> Optional[str]:
+    """Return codec_name of the first video stream, or None if not found/ffprobe missing."""
+    try:
+        result = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", filepath])
+        info = json.loads(result.stdout or "{}")
+        for s in info.get("streams", []):
+            if s.get("codec_type") == "video":
+                return s.get("codec_name")
+        return None
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def ensure_h264(input_path: str, output_path: Optional[str] = None, crf: int = 23, preset: str = "slow") -> Optional[str]:
+    """
+    Ensure the given video is H.264 using ffprobe+ffmpeg. Returns the H.264 file path or None on error.
+    - If already H.264, returns the original (or renames to output_path if provided).
+    - Otherwise, uses ffmpeg (libx264) to convert.
+    """
+    if output_path is None:
+        root, ext = os.path.splitext(input_path)
+        output_path = f"{root}_h264.mp4" if ext.lower() == ".mp4" else f"{input_path}_h264.mp4"
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    codec = probe_video_codec(input_path)
+    if codec == "h264":
+        if os.path.abspath(input_path) != os.path.abspath(output_path):
+            try:
+                os.replace(input_path, output_path)
+            except OSError:
+                # fallback to copy
+                import shutil
+                shutil.copy2(input_path, output_path)
+        return output_path
+
+    # Not H.264 → convert
+    try:
+        _run([
+            "ffmpeg",
+            "-y",
+            "-i", input_path,
+            "-c:v", "libx264",
+            "-preset", preset,
+            "-crf", str(crf),
+            "-movflags", "+faststart",
+            output_path,
+        ])
+        return output_path
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+# ---------------------- Main conversion ----------------------
+
+def convert_npy_folder_to_mp4(
+    input_dir: str,
+    out_path: Optional[str] = None,
+    out_dir: Optional[str] = None,
+    out_name: str = "depth.mp4",
+    fps: float = 30.0,
+    pattern: str = "*.npy",
+    colormap: str = "turbo",
+    percentiles: Optional[Tuple[float, float]] = (1.0, 99.0),
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
+    mask_zero: bool = True,
+    global_norm: bool = True,
+    global_samples: int = 50,
+    size: Optional[Tuple[int, int]] = None,  # (width, height)
+    rotate: int = 0,
+    flip: str = "none",
+    # Writer preference: try H.264 directly; fallback to mp4v (converted after)
+    prefer_fourcc: str = "avc1",
+    fallback_fourcc: str = "mp4v",
+    quality: Optional[int] = None,
+    progress: Optional[Callable[[int, int, str], None]] = None,
+    # H.264 post-conversion settings:
+    h264_crf: int = 23,
+    h264_preset: str = "slow",
+) -> dict:
+    """
+    Convert all `.npy` files in a folder to MP4 and ensure the final file is H.264.
+    Writes with OpenCV first (trying H.264) and, if needed, converts with ffmpeg.
+
+    Returns
+    -------
+    dict with meta info:
+      {
+        'frames_written', 'size', 'vmin', 'vmax',
+        'writer_fourcc', 'fps',
+        'raw_out_path', 'final_out_path',
+        'raw_codec', 'final_codec',
+        'h264_ensured': bool
+      }
+    """
+    files = list_npy_files(input_dir, pattern)
+    if not files:
+        raise FileNotFoundError(f"No .npy files in '{input_dir}' matching pattern '{pattern}'.")
+
+    # Resolve output paths
+    final_out = _resolve_out_path(out_path, out_dir, out_name, default_dir=input_dir)
+    tmp_out = final_out.replace(".mp4", "_raw.mp4")
+
+    # Load first frame to determine shape
+    first = np.load(files[0], allow_pickle=False)
+    if first.ndim == 3 and first.shape[-1] == 1:
+        first = first[..., 0]
+    elif first.ndim != 2:
+        raise ValueError(f"Unexpected array shape {first.shape} in {files[0]}. Expected 2D or (H,W,1).")
+
+    first = apply_geometric_ops(first, rotate, flip)
+
+    # Determine target size
+    if size is None:
+        h, w = first.shape[:2]
+        frame_size = (w, h)  # (W, H)
+    else:
+        frame_size = (int(size[0]), int(size[1]))
+
+    # Global normalization (if requested and not fixed vmin/vmax)
+    gvmin, gvmax = vmin, vmax
+    if global_norm and (gvmin is None or gvmax is None):
+        if global_samples >= len(files):
+            sample_paths = files
+        else:
+            idxs = np.linspace(0, len(files) - 1, num=global_samples, dtype=int)
+            sample_paths = [files[i] for i in idxs]
+
+        sample_arrays: List[np.ndarray] = []
+        for p in sample_paths:
+            a = np.load(p, allow_pickle=False)
+            if a.ndim == 3 and a.shape[-1] == 1:
+                a = a[..., 0]
+            elif a.ndim != 2:
+                raise ValueError(f"Unexpected array shape {a.shape} in {p}. Expected 2D or (H,W,1).")
+            a = apply_geometric_ops(a, rotate, flip)
+            sample_arrays.append(a)
+
+        gvmin, gvmax = compute_norm_bounds(sample_arrays, vmin, vmax, percentiles, mask_zero)
+
+    # Try to open H.264 writer first, else fallback
+    def open_writer(fourcc: str) -> cv2.VideoWriter:
+        writer = cv2.VideoWriter(
+            tmp_out,
+            cv2.VideoWriter_fourcc(*fourcc),
+            fps,
+            frame_size,
+            True,
+        )
+        if quality is not None:
+            try:
+                writer.set(cv2.VIDEOWRITER_PROP_QUALITY, int(quality))
+            except Exception:
+                pass
+        return writer
+
+    writer = open_writer(prefer_fourcc)
+    used_fourcc = prefer_fourcc
+    if not writer.isOpened():
+        writer = open_writer(fallback_fourcc)
+        used_fourcc = fallback_fourcc
+
+    if not writer.isOpened():
+        raise RuntimeError("Could not open any VideoWriter. Try installing an OpenCV build with H.264 support.")
+
+    frames_written = 0
+    for i, fp in enumerate(files):
+        a = np.load(fp, allow_pickle=False)
+        if a.ndim == 3 and a.shape[-1] == 1:
+            a = a[..., 0]
+        elif a.ndim != 2:
+            raise ValueError(f"Unexpected array shape {a.shape} in {fp}. Expected 2D or (H,W,1).")
+
+        a = apply_geometric_ops(a, rotate, flip)
+
+        if not global_norm and (vmin is None or vmax is None):
+            vmin_f, vmax_f = compute_norm_bounds([a], None, None, percentiles, mask_zero)
+        else:
+            vmin_f, vmax_f = gvmin, gvmax
+
+        img_u8 = normalize_to_uint8(a, float(vmin_f), float(vmax_f), mask_zero)
+        img_bgr = to_bgr(img_u8, colormap)
+
+        if (img_bgr.shape[1], img_bgr.shape[0]) != frame_size:
+            img_bgr = cv2.resize(img_bgr, frame_size, interpolation=cv2.INTER_LINEAR)
+
+        writer.write(img_bgr)
+        frames_written += 1
+
+        if progress is not None:
+            try:
+                progress(i + 1, len(files), fp)
+            except Exception:
+                pass
+
+    writer.release()
+
+    # Probe raw output codec
+    raw_codec = probe_video_codec(tmp_out)
+
+    # Ensure final is H.264 using ffmpeg (like your example)
+    ensured_path = ensure_h264(tmp_out, output_path=final_out, crf=h264_crf, preset=h264_preset)
+    final_codec = probe_video_codec(ensured_path) if ensured_path else None
+    h264_ok = (final_codec == "h264")
+
+    return {
+        "frames_written": frames_written,
+        "size": frame_size,
+        "vmin": float(gvmin) if gvmin is not None else None,
+        "vmax": float(gvmax) if gvmax is not None else None,
+        "writer_fourcc": used_fourcc,
+        "fps": fps,
+        "raw_out_path": tmp_out,
+        "final_out_path": ensured_path,
+        "raw_codec": raw_codec,
+        "final_codec": final_codec,
+        "h264_ensured": bool(h264_ok and ensured_path),
+    }
+
+
+======================================================================
+Dateiname:      tracker.py
+Relativer Pfad: tracker.py
+----------------------------------------------------------------------
+from __future__ import annotations
+import os
+import subprocess
+from pathlib import Path
+from typing import Optional
+
+
+def run_spatial_tracker(
+    video_path: str,
+    mask_path: str,
+    chunk_size: int,
+    output_folder: str,
+    tracker_script: str = "chunked_demo.py",
+) -> Optional[str]:
+    """
+    Run the SpatialTracker script and return the produced tracking .npy path.
+    """
+    print("\n🚀 Running SpatialTracker ...")
+
+    abs_video = os.path.abspath(video_path)
+    abs_mask = os.path.abspath(mask_path)
+    abs_out = os.path.abspath(output_folder)
+    os.makedirs(abs_out, exist_ok=True)
+
+    cmd = [
+        "python", tracker_script,
+        "--vid_name", abs_video,
+        "--mask_name", abs_mask,
+        "--outdir", abs_out,
+        "--chunk_size", str(chunk_size),
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line.rstrip())
+        rc = proc.wait()
+        if rc != 0:
+            print(f"❌ SpatialTracker exited with code {rc}.")
+            return None
+
+        print("✔️ SpatialTracker completed.")
+
+        # Find newest subdir and expected tracking file name
+        subfolders = [p.path for p in os.scandir(abs_out) if p.is_dir()]
+        if not subfolders:
+            print("❌ No output subfolder found.")
+            return None
+
+        latest = max(subfolders, key=os.path.getmtime)
+        video_stem = Path(abs_video).stem
+        tracking_file = os.path.join(latest, f"{video_stem}_tracking_data.npy")
+
+        if os.path.exists(tracking_file):
+            print(f"✔️ Tracking data: {tracking_file}")
+            return tracking_file
+
+        print(f"❌ Tracking file not found: {tracking_file}")
+        return None
+
+    except FileNotFoundError as e:
+        print(f"❌ Tracker not found: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ Unexpected error while running tracker: {e}")
+        return None
+
+
+
+======================================================================
+Dateiname:      video_io.py
+Relativer Pfad: video_io.py
+----------------------------------------------------------------------
+import json
+import os
+import subprocess
+from typing import Optional
+
+import requests
+from tqdm import tqdm
+
+
+def download_and_ensure_h264(url: str, folder: str, filename: str) -> Optional[str]:
+    """
+    Downloads a video to `folder/filename` if missing, inspects the codec via ffprobe,
+    and converts to H.264 if necessary. Returns the path to the H.264 mp4.
+    """
+    os.makedirs(folder, exist_ok=True)
+
+    original_filepath = os.path.join(folder, filename)
+    h264_filepath = original_filepath.replace(".mp4", "_h264.mp4")
+
+    if not os.path.exists(original_filepath):
+        print(f"📥 Downloading video: {filename}")
+        try:
+            with requests.get(url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get("content-length", 0))
+                with open(original_filepath, "wb") as f, tqdm(
+                    desc=filename, total=total_size, unit="B", unit_scale=True, unit_divisor=1024
+                ) as bar:
+                    for chunk in r.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            f.write(chunk)
+                            bar.update(len(chunk))
+            print("Video download complete.")
+        except requests.RequestException as e:
+            print(f"❌ Download error: {e}")
+            return None
+    else:
+        print(f"Video already exists, skipping download: {filename}")
+
+    print(f"🔬 Probing codec: {filename}")
+    try:
+        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", original_filepath]
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        info = json.loads(result.stdout)
+        codec_name = next(
+            (s.get("codec_name") for s in info.get("streams", []) if s.get("codec_type") == "video"), None
+        )
+        if not codec_name:
+            print("❌ No video stream found.")
+            return None
+        print(f"✔️ Detected codec: {codec_name}")
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(f"❌ ffprobe error. Ensure ffmpeg/ffprobe is installed. Error: {e}")
+        return None
+
+    if codec_name == "h264":
+        print("✅ Video is already H.264 compatible.")
+        if original_filepath != h264_filepath and os.path.exists(original_filepath):
+            os.replace(original_filepath, h264_filepath)
+        return h264_filepath
+
+    print(f"⚠️ Incompatible codec '{codec_name}'. Converting to H.264 ...")
+    convert_cmd = [
+        "ffmpeg",
+        "-i",
+        original_filepath,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "slow",
+        "-crf",
+        "23",
+        "-y",
+        h264_filepath,
+    ]
+    try:
+        subprocess.run(convert_cmd, check=True, capture_output=True, text=True)
+        print(f"✨ Conversion successful: {h264_filepath}")
+        return h264_filepath
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Conversion error: {e.stderr}")
+        return None
+
+======================================================================
+Dateiname:      chunked_demo.py
+Relativer Pfad: ../chunked_demo.py
+----------------------------------------------------------------------
+"""
+
+import os
+import sys
+import argparse
+import time
+import numpy as np
+from PIL import Image
+import cv2
+from easydict import EasyDict as edict
+import traceback
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+
+from moviepy.editor import ImageSequenceClip
+import moviepy
+
+# Import necessary modules from the existing project
+from models.spatracker.predictor import SpaTrackerPredictor
+from models.spatracker.utils.visualizer import Visualizer, read_video_from_path
+from models.spatracker.models.core.spatracker.spatracker import get_points_on_a_grid
+from mde import MonoDEst
+
+# ---------------------- Helpers ----------------------
+def resolve_path(root: str, name: str) -> str:
+    """
+    Join to root only if 'name' is not absolute.
+    Return absolute, normalized path.
+    """
+    p = Path(name)
+    if not p.is_absolute():
+        p = Path(root) / p
+    return str(p.resolve())
+
+
+# ---------------------- Argument Parsing ----------------------
+parser = argparse.ArgumentParser(description="Chunked Object Tracking with SpaTracker (segmentation mask only in the first chunk)")
+parser.add_argument('--root', type=str, default='./assets', help='Path to the folder with the video and optionally depth maps')
+parser.add_argument('--vid_name', type=str, default='breakdance', help='Name of the video or path (with or without .mp4)')
+parser.add_argument('--mask_name', type=str, default=None, help='Name or path of the segmentation mask file (e.g., my_mask.png). If None, uses vid_name.png or a full mask.')
+parser.add_argument('--gpu', type=int, default=0, help='GPU ID')
+parser.add_argument('--model', type=str, default='spatracker', help='Model name (only spatracker is supported)')
+parser.add_argument('--downsample', type=float, default=0.8, help='Processing scale factor. <1 downsamples, >1 upsamples if video is too small.')
+parser.add_argument('--grid_size', type=int, default=50, help='Grid size for initial point sampling (used only in the first chunk with mask)')
+parser.add_argument('--outdir', type=str, default='./vis_results', help='Output directory (a timestamped subfolder will be created inside)')
+parser.add_argument('--fps', type=float, default=1.0, help='Frame sampling *step* for processing (e.g., 1.0 processes every frame, 2.0 every other frame)')
+parser.add_argument('--len_track', type=int, default=10, help='Length of the track visualization trail')
+parser.add_argument('--fps_vis', type=int, default=30, help='FPS for the output visualization video')
+parser.add_argument('--crop', action='store_true', help='Crop the video based on a fixed factor')
+parser.add_argument('--crop_factor', type=float, default=1.0, help='Crop factor if --crop is used (e.g., 1.0 for 384x512 base)')
+parser.add_argument('--backward', action='store_true', help='Enable backward tracking')
+parser.add_argument('--vis_support', action='store_true', help='Visualize support points (if model supports it)')
+parser.add_argument('--query_frame', type=int, default=0, help='Absolute query frame index for grid initialization (used for the first chunk). Should be 0 for mask on 1st abs. frame.')
+parser.add_argument('--point_size', type=int, default=3, help='Size of the visualized points')
+parser.add_argument('--rgbd', action='store_true', help='Whether to use RGBD as input (expects pre-computed depth maps)')
+parser.add_argument('--chunk_size', type=int, default=30, help='Number of frames per processing chunk (output segment length)')
+parser.add_argument('--s_length_model', type=int, default=12, help="SpaTracker's internal processing window length (S_length)")
+
+args = parser.parse_args()
+
+# ---------------------- Setup & Preparation ----------------------
+print(f"MoviePy version: {moviepy.__version__}")
+
+os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
+device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+
+root_dir = args.root
+
+vid_name = args.vid_name
+if not vid_name.lower().endswith(".mp4"):
+    vid_name += ".mp4"
+    print("Filename did not end with .mp4, so '.mp4' was added.")
+
+vid_path = resolve_path(root_dir, vid_name)
+video_stem = Path(vid_path).stem  # Used for file names
+
+if args.mask_name:
+    seg_path = resolve_path(root_dir, args.mask_name)
+else:
+    seg_path = resolve_path(root_dir, args.vid_name + '.png')
+
+# --- Create timestamped run directory inside outdir ---
+base_outdir = args.outdir
+os.makedirs(base_outdir, exist_ok=True)
+timestamp = time.strftime("%Y-%m-%d_%H%M%S")  # local time
+run_dir = os.path.join(base_outdir, f"{timestamp}_{video_stem}")
+os.makedirs(run_dir, exist_ok=True)
+outdir = run_dir
+print(f"All outputs will be saved to: {outdir}")
+
+print("Loading video...")
+print(f"Resolved video path: {vid_path} (exists: {os.path.exists(vid_path)})")
+print(f"Resolved mask path:  {seg_path} (exists: {os.path.exists(seg_path)})")
+
+# robust video load (raises with clear error if it fails)
+video_np = read_video_from_path(vid_path)  # Returns uint8 HWC RGB numpy
+video_full_torch = torch.from_numpy(video_np).permute(0, 3, 1, 2)[None].float()  # B T C H W, values 0-255
+
+H_raw, W_raw = video_full_torch.shape[-2:]
+if os.path.exists(seg_path):
+    print(f"Loading segmentation mask from: {seg_path}")
+    segm_mask_np_raw = np.array(Image.open(seg_path))
+    if len(segm_mask_np_raw.shape) == 3:
+        segm_mask_np_raw = (segm_mask_np_raw[..., :3].mean(axis=-1) > 0).astype(np.uint8)
+    if segm_mask_np_raw.shape[0] != H_raw or segm_mask_np_raw.shape[1] != W_raw:
+        print(f"Resizing segmentation mask from {segm_mask_np_raw.shape} to raw video dimensions {H_raw}x{W_raw}")
+        segm_mask_np_raw = cv2.resize(segm_mask_np_raw, (W_raw, H_raw), interpolation=cv2.INTER_NEAREST)
+else:
+    print(f"Segmentation mask not found at: {seg_path}. Using a full-image mask for the first chunk if grid_size > 0.")
+    segm_mask_np_raw = np.ones((H_raw, W_raw), dtype=np.uint8)
+
+H_after_crop, W_after_crop = H_raw, W_raw
+segm_mask_np_after_crop = segm_mask_np_raw
+crop_transform = None
+
+if args.crop:
+    print("Applying center crop...")
+    base_crop_h, base_crop_w = 384, 512
+    target_crop_h = int(base_crop_h * args.crop_factor)
+    target_crop_w = int(base_crop_w * args.crop_factor)
+
+    crop_transform = transforms.CenterCrop((target_crop_h, target_crop_w))
+
+    video_full_torch_list = [crop_transform(video_full_torch[0, t]) for t in range(video_full_torch.shape[1])]
+    video_full_torch = torch.stack(video_full_torch_list, dim=0).unsqueeze(0)
+
+    segm_mask_torch_temp = torch.from_numpy(segm_mask_np_raw[None, None]).float()
+    segm_mask_torch_cropped = crop_transform(segm_mask_torch_temp)
+    segm_mask_np_after_crop = segm_mask_torch_cropped[0, 0].numpy().astype(np.uint8)
+
+    H_after_crop, W_after_crop = video_full_torch.shape[-2:]
+    print(f"Video and mask cropped to: {H_after_crop}x{W_after_crop}")
+
+processing_scale_factor = args.downsample
+if H_after_crop > 0 and W_after_crop > 0:
+    ref_h, ref_w = 640.0, 960.0
+    if H_after_crop > W_after_crop:
+        processing_scale_factor = max(args.downsample, (ref_h / H_after_crop))
+    elif W_after_crop > H_after_crop:
+        processing_scale_factor = max(args.downsample, (ref_w / W_after_crop))
+    else:
+        processing_scale_factor = max(args.downsample, (ref_h / H_after_crop))
+else:
+    print("Warning: Video dimensions after crop are zero. Using default processing_scale_factor from args.")
+
+if processing_scale_factor != 1.0:
+    print(f"Resizing video with factor: {processing_scale_factor:.2f} for model processing")
+    if video_full_torch.shape[1] > 0:
+        batch_of_frames = video_full_torch[0]
+        video_full_torch_resized_frames = F.interpolate(batch_of_frames, scale_factor=processing_scale_factor, mode='bilinear', align_corners=True, recompute_scale_factor=True)
+        video_full_torch_resized = video_full_torch_resized_frames.unsqueeze(0)
+    else:
+        video_full_torch_resized = video_full_torch
+else:
+    video_full_torch_resized = video_full_torch
+print(f"Video shape for model processing (before frame selection): {video_full_torch_resized.shape}")
+
+# --- Safe frame step (args.fps is actually a step) ---
+step = max(1, int(round(args.fps)))
+frame_indices_to_process = torch.arange(0, video_full_torch.shape[1], step).long()
+
+video_processed_full = video_full_torch_resized[:, frame_indices_to_process]
+
+T_full_processed = video_processed_full.shape[1]
+H_processed, W_processed = video_processed_full.shape[-2:]
+print(f"Processed video for model has {T_full_processed} frames after selection (step={step}), with resolution {H_processed}x{W_processed}.")
+
+video_for_overlay_original_res = video_full_torch[:, frame_indices_to_process].cpu()  # float 0-255
+print(f"Video for final overlay has {video_for_overlay_original_res.shape[1]} frames, with resolution {H_after_crop}x{W_after_crop}.")
+
+if segm_mask_np_after_crop.shape[0] != H_processed or segm_mask_np_after_crop.shape[1] != W_processed:
+    segm_mask_processed_np = cv2.resize(segm_mask_np_after_crop, (W_processed, H_processed), interpolation=cv2.INTER_NEAREST)
+else:
+    segm_mask_processed_np = segm_mask_np_after_crop
+
+# ---------------------- Model & Depth Predictor Setup ----------------------
+if args.model != "spatracker":
+    raise ValueError("Only 'spatracker' model is supported.")
+
+print("Initializing SpaTracker model...")
+model = SpaTrackerPredictor(
+    checkpoint=os.path.join('./checkpoints/spaT_final.pth'),
+    interp_shape=(384, 512),
+    seq_length=args.s_length_model
+)
+if torch.cuda.is_available():
+    model = model.to(device)
+
+depth_predictor_model_instance = None
+depths_full_torch_processed = None
+if args.rgbd:
+    DEPTH_DIR = os.path.join(root_dir, args.vid_name + "_depth")
+    if not os.path.isdir(DEPTH_DIR):
+        print(f"Warning: Depth directory {DEPTH_DIR} not found. Proceeding without pre-loaded depth.")
+        args.rgbd = False
+    else:
+        print(f"Loading depth maps from {DEPTH_DIR}...")
+        depths_list_for_selected_frames = []
+        all_original_depth_files = sorted([os.path.join(DEPTH_DIR, fname) for fname in os.listdir(DEPTH_DIR) if fname.endswith((".npy", ".png"))])
+
+        for original_frame_idx in frame_indices_to_process.tolist():
+            if original_frame_idx < len(all_original_depth_files):
+                depth_map_path = all_original_depth_files[original_frame_idx]
+                if depth_map_path.endswith(".npy"):
+                    depth_orig_res = np.load(depth_map_path)
+                else:
+                    depth_img = Image.open(depth_map_path)
+                    depth_orig_res = np.array(depth_img).astype(np.float32)
+                    if len(depth_orig_res.shape) == 3:
+                        depth_orig_res = depth_orig_res[..., 0]
+
+                depth_cropped_res = depth_orig_res
+                if args.crop and crop_transform is not None:
+                    temp_depth_torch = torch.from_numpy(depth_orig_res[None, None, :, :]).float()
+                    try:
+                        temp_depth_cropped = crop_transform(temp_depth_torch)
+                        depth_cropped_res = temp_depth_cropped[0, 0].numpy()
+                    except RuntimeError as e:
+                        print(f"Warning: Could not apply crop_transform to depth map {depth_map_path} (shape {temp_depth_torch.shape}). Error: {e}. Using uncropped depth and resizing.")
+
+                if depth_cropped_res.shape[0] != H_processed or depth_cropped_res.shape[1] != W_processed:
+                    depth_resized = cv2.resize(depth_cropped_res, (W_processed, H_processed), interpolation=cv2.INTER_NEAREST)
+                else:
+                    depth_resized = depth_cropped_res
+                depths_list_for_selected_frames.append(depth_resized)
+            else:
+                print(f"Warning: Depth map for original frame index {original_frame_idx} not found. Using zeros.")
+                depths_list_for_selected_frames.append(np.zeros((H_processed, W_processed), dtype=np.float32))
+
+        if depths_list_for_selected_frames:
+            depths_full_torch_processed = torch.from_numpy(np.stack(depths_list_for_selected_frames, axis=0)).float()[:, None]
+            if torch.cuda.is_available():
+                depths_full_torch_processed = depths_full_torch_processed.to(device)
+        else:
+            print(f"Warning: No depth maps loaded from {DEPTH_DIR}, even though --rgbd was set. Proceeding without pre-loaded depth.")
+            args.rgbd = False
+
+if not args.rgbd:
+    print("Initializing Monocular Depth Estimator (ZoeDepth NK)...")
+    monodepth = MonoDEst(edict({"mde_name": "zoedepth_nk"}))
+    depth_predictor_model_instance = monodepth.model
+    if torch.cuda.is_available():
+        depth_predictor_model_instance = depth_predictor_model_instance.to(device)
+    depth_predictor_model_instance.eval()
+
+# ---------------------- Chunking and Processing ----------------------
+S_MODEL_INTERNAL_WINDOW = args.s_length_model
+overlap_frames = S_MODEL_INTERNAL_WINDOW // 2
+
+chunk_size = args.chunk_size
+num_chunks = (T_full_processed + chunk_size - 1) // chunk_size
+if T_full_processed == 0:
+    num_chunks = 0
+print(f"Video will be processed in {num_chunks} chunk(s) of up to {chunk_size} frames each.")
+
+all_pred_tracks_list = []
+all_pred_visibility_list = []
+processed_video_frames_for_moviepy = []
+
+prev_queries_for_next_chunk = None
+
+for chunk_idx in range(num_chunks):
+    print(f"\n--- Processing Chunk {chunk_idx + 1}/{num_chunks} ---")
+
+    actual_chunk_start_global = chunk_idx * chunk_size
+    actual_chunk_end_global = min((chunk_idx + 1) * chunk_size, T_full_processed)
+    num_frames_in_actual_chunk = actual_chunk_end_global - actual_chunk_start_global
+
+    if num_frames_in_actual_chunk <= 0:
+        print(f"Skipping empty or invalid chunk {chunk_idx + 1}")
+        continue
+
+    current_dynamic_overlap = overlap_frames if chunk_idx > 0 else 0
+    model_feed_start_global = actual_chunk_start_global - current_dynamic_overlap
+    model_feed_end_global = actual_chunk_end_global
+    model_feed_start_global = max(0, model_feed_start_global)
+
+    print(f"Actual chunk frame indices (global, from processed video): {actual_chunk_start_global} to {actual_chunk_end_global - 1}")
+    print(f"Model will be fed frames (global, from processed video): {model_feed_start_global} to {model_feed_end_global - 1}")
+
+    chunk_video_for_model = video_processed_full[:, model_feed_start_global:model_feed_end_global]
+    if torch.cuda.is_available():
+        chunk_video_for_model = chunk_video_for_model.to(device)
+
+    depth_chunk_for_model = None
+    if args.rgbd and depths_full_torch_processed is not None and depths_full_torch_processed.shape[0] > 0:
+        depth_chunk_for_model = depths_full_torch_processed[model_feed_start_global:model_feed_end_global].unsqueeze(0)
+        if torch.cuda.is_available():
+            depth_chunk_for_model = depth_chunk_for_model.to(device)
+
+    query_time_in_model_feed = actual_chunk_start_global - model_feed_start_global
+
+    current_queries_for_model_input = None
+    current_grid_size_for_model_input = 0
+    current_segm_mask_for_model_input = None
+    grid_query_frame_for_model_feed_input = 0
+
+    if chunk_idx == 0:
+        if args.grid_size > 0:
+            print(f"Generating initial queries for first chunk using grid_size {args.grid_size} and mask.")
+            grid_pts_on_processed_res = get_points_on_a_grid(args.grid_size, (H_processed, W_processed), device=torch.device('cpu'))
+
+            point_mask_indices_y = grid_pts_on_processed_res[0, :, 1].round().long().clamp(0, H_processed - 1)
+            point_mask_indices_x = grid_pts_on_processed_res[0, :, 0].round().long().clamp(0, W_processed - 1)
+            point_mask = segm_mask_processed_np[point_mask_indices_y.numpy(), point_mask_indices_x.numpy()].astype(bool)
+
+            masked_grid_pts = grid_pts_on_processed_res[:, point_mask]
+
+            num_masked_points_to_take = min(800, masked_grid_pts.shape[1])
+            if masked_grid_pts.shape[1] > num_masked_points_to_take:
+                perm_indices = torch.randperm(masked_grid_pts.shape[1])[:num_masked_points_to_take]
+                masked_grid_pts = masked_grid_pts[:, perm_indices]
+
+            if masked_grid_pts.shape[1] > 0:
+                current_queries_for_model_input = torch.zeros(1, masked_grid_pts.shape[1], 3, device=torch.device('cpu'))
+                if args.query_frame != 0:
+                    print(f"Warning: args.query_frame is {args.query_frame}. For segmentation mask on the *very first video frame* (after selection), set --query_frame 0.")
+                current_queries_for_model_input[0, :, 0] = args.query_frame
+                current_queries_for_model_input[0, :, 1:] = masked_grid_pts[0]
+
+                if torch.cuda.is_available():
+                    current_queries_for_model_input = current_queries_for_model_input.to(device)
+                print(f"Generated {current_queries_for_model_input.shape[1]} initial queries from masked grid.")
+            else:
+                print("Warning: Segmentation mask resulted in 0 points from the grid. SpaTracker may run in dense mode or track no points.")
+                current_queries_for_model_input = torch.empty(1, 0, 3).to(device if torch.cuda.is_available() else 'cpu')
+
+            current_grid_size_for_model_input = 0
+            current_segm_mask_for_model_input = None
+            grid_query_frame_for_model_feed_input = 0
+        else:
+            print("No grid_size for the first chunk. SpaTracker will run in dense mode (no initial queries).")
+            current_queries_for_model_input = None
+    else:
+        if prev_queries_for_next_chunk is not None and prev_queries_for_next_chunk.shape[1] > 0:
+            current_queries_for_model_input = prev_queries_for_next_chunk.clone()
+            current_queries_for_model_input[0, :, 0] = query_time_in_model_feed
+            if torch.cuda.is_available():
+                current_queries_for_model_input = current_queries_for_model_input.to(device)
+            print(f"Using {current_queries_for_model_input.shape[1]} propagated queries. Query time for model input: {query_time_in_model_feed}")
+        else:
+            print(f"Warning: No valid queries from previous chunk for chunk {chunk_idx + 1}. SpaTracker may run in dense mode.")
+            current_queries_for_model_input = None
+
+    start_time_tracking = time.time()
+    if not args.rgbd and depth_predictor_model_instance is not None and torch.cuda.is_available():
+        depth_predictor_model_instance = depth_predictor_model_instance.to(device)
+
+    with torch.no_grad():
+        pred_tracks, pred_visibility, T_Firsts = model(
+            chunk_video_for_model,
+            video_depth=depth_chunk_for_model,
+            queries=current_queries_for_model_input,
+            segm_mask=current_segm_mask_for_model_input,
+            grid_size=current_grid_size_for_model_input,
+            grid_query_frame=grid_query_frame_for_model_feed_input,
+            backward_tracking=args.backward,
+            depth_predictor=depth_predictor_model_instance if (not args.rgbd and depth_predictor_model_instance is not None) else None,
+            wind_length=S_MODEL_INTERNAL_WINDOW
+        )
+    end_time_tracking = time.time()
+    print(f"Tracking for chunk {chunk_idx+1} (model input length {chunk_video_for_model.shape[1]}) took {end_time_tracking - start_time_tracking:.2f} seconds.")
+
+    pred_slice_start = query_time_in_model_feed
+    pred_slice_end = pred_slice_start + num_frames_in_actual_chunk
+
+    pred_tracks_actual_chunk = pred_tracks[:, pred_slice_start:pred_slice_end]
+    pred_visibility_actual_chunk = pred_visibility[:, pred_slice_start:pred_slice_end]
+
+    all_pred_tracks_list.append(pred_tracks_actual_chunk.cpu())
+    all_pred_visibility_list.append(pred_visibility_actual_chunk.cpu())
+
+    video_actual_chunk_cpu = video_processed_full[:, actual_chunk_start_global:actual_chunk_end_global].cpu()
+    for t_idx_in_actual_chunk in range(video_actual_chunk_cpu.shape[1]):
+        frame_t = video_actual_chunk_cpu[0, t_idx_in_actual_chunk].permute(1, 2, 0).numpy()
+        if frame_t.dtype in (np.float32, np.float64):
+            if frame_t.min() >= 0 and frame_t.max() <= 1.0:
+                frame_t = frame_t * 255.0
+        frame_t = np.clip(frame_t, 0, 255).astype(np.uint8)
+        processed_video_frames_for_moviepy.append(frame_t)
+
+    if pred_tracks.shape[1] > 0 and pred_tracks.shape[2] > 0:
+        num_points_in_pred = pred_tracks.shape[2]
+        prev_queries_for_next_chunk = torch.zeros(1, num_points_in_pred, 3, device=pred_tracks.device)
+        prev_queries_for_next_chunk[0, :, 1:] = pred_tracks[0, -1, :, :2]
+        prev_queries_for_next_chunk[0, :, 0] = 0
+    else:
+        prev_queries_for_next_chunk = None
+        print(f"Warning: Chunk {chunk_idx+1} model output resulted in no tracks to propagate ({pred_tracks.shape}).")
+
+    del chunk_video_for_model, depth_chunk_for_model, current_queries_for_model_input, current_segm_mask_for_model_input
+    del pred_tracks, pred_visibility, T_Firsts, pred_tracks_actual_chunk, pred_visibility_actual_chunk
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+if not all_pred_tracks_list or not processed_video_frames_for_moviepy:
+    print("No tracks or video frames were processed/predicted. Exiting.")
+    if processed_video_frames_for_moviepy:
+        final_clip_moviepy = ImageSequenceClip(processed_video_frames_for_moviepy, fps=args.fps_vis)
+        final_output_file = os.path.join(outdir, f"{video_stem}_final_no_tracks_processed_res.mp4")
+        try:
+            final_clip_moviepy.write_videofile(final_output_file, codec="libx264", fps=args.fps_vis, logger='bar')
+            print(f"Final video (no tracks, processed resolution) saved to: {final_output_file}")
+        except Exception as e:
+            print(f"Error saving final video (no tracks) with moviepy: {e}")
+            print(traceback.format_exc())
+        finally:
+            if 'final_clip_moviepy' in locals() and hasattr(final_clip_moviepy, 'close'):
+                final_clip_moviepy.close()
+    sys.exit()
+
+final_pred_tracks_full_video = torch.cat(all_pred_tracks_list, dim=1)
+final_pred_visibility_full_video = torch.cat(all_pred_visibility_list, dim=1)
+
+print("\n--- Visualizing Full Prediction ---")
+
+# --- STEP 1: Save a sample frame of the video intended for visualization ---
+if video_for_overlay_original_res.nelement() > 0 and video_for_overlay_original_res.shape[1] > 0:
+    sample_frame_to_save_np = video_for_overlay_original_res[0, 0].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+    try:
+        pil_img = Image.fromarray(sample_frame_to_save_np)
+        sample_frame_path = os.path.join(outdir, f"{video_stem}_DEBUG_sample_overlay_input_frame.png")
+        pil_img.save(sample_frame_path)
+        print(f"DEBUG: Saved a sample input frame for visualization to {sample_frame_path}")
+    except Exception as e_save_frame:
+        print(f"DEBUG: Could not save sample input frame: {e_save_frame}")
+        print(traceback.format_exc())
+else:
+    print("DEBUG: video_for_overlay_original_res is empty, cannot save a sample frame.")
+# --- END STEP 1 ---
+
+# Initialize Visualizer
+USE_GRAYSCALE_TEST = False
+print(f"DEBUG: Initializing Visualizer with grayscale={USE_GRAYSCALE_TEST}")
+vis_tool = Visualizer(
+    save_dir=outdir,
+    grayscale=USE_GRAYSCALE_TEST,
+    fps=args.fps_vis,
+    pad_value=0,
+    linewidth=args.point_size,
+    tracks_leave_trace=args.len_track
+)
+
+if final_pred_tracks_full_video.shape[2] == 0:
+    print("No track points to visualize after concatenation.")
+    if processed_video_frames_for_moviepy:
+        final_clip_moviepy = ImageSequenceClip(processed_video_frames_for_moviepy, fps=args.fps_vis)
+        final_output_file = os.path.join(outdir, f"{video_stem}_final_no_tracks_to_visualize_processed_res.mp4")
+        try:
+            final_clip_moviepy.write_videofile(final_output_file, codec="libx264", fps=args.fps_vis, logger='bar')
+            print(f"Final video (no tracks to visualize, processed resolution) saved to: {final_output_file}")
+        except Exception as e:
+            print(f"Error saving final video (no tracks) with moviepy: {e}")
+            print(traceback.format_exc())
+        finally:
+            if 'final_clip_moviepy' in locals() and hasattr(final_clip_moviepy, 'close'):
+                final_clip_moviepy.close()
+    sys.exit()
+
+# Prepare video tensor for visualizer
+video_for_viz_input_tensor = video_for_overlay_original_res.float()  # float 0-255
+
+tracks_xy_for_viz = final_pred_tracks_full_video[..., :2].clone()
+
+if W_processed != W_after_crop or H_processed != H_after_crop:
+    print(f"Scaling tracks from processing resolution {W_processed}x{H_processed} to overlay resolution {W_after_crop}x{H_after_crop}.")
+    scale_x = W_after_crop / W_processed if W_processed > 0 else 1.0
+    scale_y = H_after_crop / H_processed if H_processed > 0 else 1.0
+
+    tracks_xy_for_viz[..., 0] = tracks_xy_for_viz[..., 0] * scale_x
+    tracks_xy_for_viz[..., 1] = tracks_xy_for_viz[..., 1] * scale_y
+else:
+    print(f"No track scaling needed for visualization. Overlay resolution: {W_after_crop}x{H_after_crop} (same as processing).")
+
+print(f"DEBUG: Shape of video_for_viz_input_tensor: {video_for_viz_input_tensor.shape}, Min: {video_for_viz_input_tensor.min():.4f}, Max: {video_for_viz_input_tensor.max():.4f}")
+
+# ---------------------- SAVE TRACKING DATA AS .NPY ----------------------
+try:
+    # (T, N, 2) in processed resolution
+    tracks_xy_processed_np = final_pred_tracks_full_video[0, :, :, :2].detach().cpu().numpy().astype(np.float32)
+    # (T, N, 2) in overlay/original resolution (after scaling above)
+    tracks_xy_overlay_np = tracks_xy_for_viz[0].detach().cpu().numpy().astype(np.float32)
+    # visibility -> (T, N) uint8
+    vis_tensor = final_pred_visibility_full_video
+    if vis_tensor.ndim == 4 and vis_tensor.shape[-1] == 1:
+        vis_tensor = vis_tensor[..., 0]
+    visibility_np = vis_tensor[0].detach().cpu().numpy().astype(np.uint8)
+
+    tracking_save = {
+        "tracks_xy_overlay": tracks_xy_overlay_np,          # (T, N, 2) pixels @ overlay/original resolution
+        "tracks_xy_processed": tracks_xy_processed_np,      # (T, N, 2) pixels @ processed resolution
+        "visibility": visibility_np,                        # (T, N) 0/1
+        "frame_indices_from_original": frame_indices_to_process.cpu().numpy(),  # indices used from the original video
+        "video_size_overlay_hw": (int(H_after_crop), int(W_after_crop)),
+        "video_size_processed_hw": (int(H_processed), int(W_processed)),
+        "args": vars(args),
+    }
+    tracks_npy_path = os.path.join(outdir, f"{video_stem}_tracking_data.npy")
+    np.save(tracks_npy_path, tracking_save, allow_pickle=True)
+    print(f"Saved tracking data (NumPy .npy) to: {tracks_npy_path}")
+except Exception as e:
+    print(f"Failed to save tracking data .npy: {e}")
+    print(traceback.format_exc())
+# ---------------------- END SAVE .NPY ----------------------
+
+drawn_frames_tensor_uint8 = vis_tool.draw_tracks_on_video(
+    video=video_for_viz_input_tensor,
+    tracks=tracks_xy_for_viz,
+    visibility=final_pred_visibility_full_video.cpu(),
+)
+
+if drawn_frames_tensor_uint8 is not None and drawn_frames_tensor_uint8.nelement() > 0 and drawn_frames_tensor_uint8.shape[1] > 0:
+    # --- Save a sample frame of what draw_tracks_on_video returns ---
+    try:
+        sample_output_frame_np = drawn_frames_tensor_uint8[0, 0].permute(1, 2, 0).cpu().numpy()
+        if sample_output_frame_np.dtype != np.uint8:
+            print(f"DEBUG: Visualizer output frame was {sample_output_frame_np.dtype}, converting to uint8 for saving.")
+            if sample_output_frame_np.max() <= 1.0 and sample_output_frame_np.min() >= 0.0 and sample_output_frame_np.dtype == np.float32:
+                sample_output_frame_np = (sample_output_frame_np * 255)
+            sample_output_frame_np = np.clip(sample_output_frame_np, 0, 255).astype(np.uint8)
+
+        pil_output_img = Image.fromarray(sample_output_frame_np)
+        sample_output_frame_path = os.path.join(outdir, f"{video_stem}_DEBUG_sample_visualizer_output_frame.png")
+        pil_output_img.save(sample_output_frame_path)
+        print(f"DEBUG: Saved a sample output frame from visualizer to {sample_output_frame_path}")
+    except Exception as e_save_output_frame:
+        print(f"DEBUG: Could not save sample output frame from visualizer: {e_save_output_frame}")
+        print(traceback.format_exc())
+    # --- End save sample output frame ---
+
+    frames_for_moviepy_visualization = []
+    for frame_tensor in drawn_frames_tensor_uint8[0]:  # uint8 expected
+        frame_np = frame_tensor.permute(1, 2, 0).cpu().numpy()
+        if frame_np.dtype != np.uint8:
+            print(f"WARN: Frame from visualizer output is {frame_np.dtype}, expected uint8. Clipping and casting.")
+            if frame_np.max() <= 1.0 and frame_np.min() >= 0.0 and frame_np.dtype == np.float32:
+                frame_np = (frame_np * 255)
+            frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
+        frames_for_moviepy_visualization.append(frame_np)
+
+    if frames_for_moviepy_visualization:
+        final_clip = ImageSequenceClip(frames_for_moviepy_visualization, fps=args.fps_vis)
+        final_output_file = os.path.join(outdir, f"{video_stem}_final_pred_overlay_original_res.mp4")
+
+        try:
+            print("-" * 50)
+            print(f"DEBUG: Attempting to write video to: {final_output_file}")
+            print(f"DEBUG: FPS for video: {args.fps_vis}, Type: {type(args.fps_vis)}")
+            print(f"DEBUG: Codec: libx264")
+            print(f"DEBUG: Logger: bar")
+            if 'final_clip' in locals() and final_clip is not None:
+                print(f"DEBUG: final_clip object: {final_clip}")
+                print(f"DEBUG: Is final_clip.write_videofile callable: {callable(final_clip.write_videofile)}")
+            else:
+                print("DEBUG: final_clip object is not defined or is None.")
+            print("-" * 50)
+
+            final_clip.write_videofile(final_output_file, codec="libx264", fps=args.fps_vis, logger='bar')
+            print(f"Final visualization (overlay on original resolution) saved to: {final_output_file}")
+        except Exception as e:
+            print(f"Error writing final video with moviepy: {e}")
+            print("----------- FULL TRACEBACK -----------")
+            print(traceback.format_exc())
+            print("--------------------------------------")
+        finally:
+            if 'final_clip' in locals() and hasattr(final_clip, 'close'):
+                final_clip.close()
+    else:
+        print("Conversion of visualized frames to list resulted in no frames (original resolution overlay).")
+else:
+    print("Visualization (draw_tracks_on_video for original resolution) resulted in no frames or an empty/invalid tensor.")
+    if processed_video_frames_for_moviepy:
+        print("Attempting to save the processed (downsampled) video without tracks as fallback.")
+        final_clip_raw_moviepy = ImageSequenceClip(processed_video_frames_for_moviepy, fps=args.fps_vis)
+        raw_output_file = os.path.join(outdir, f"{video_stem}_final_raw_fallback_processed_res.mp4")
+        try:
+            final_clip_raw_moviepy.write_videofile(raw_output_file, codec="libx264", fps=args.fps_vis, logger='bar')
+            print(f"Raw processed video (no tracks, processed resolution) saved to: {raw_output_file}")
+        except Exception as e_raw:
+            print(f"Error saving raw video with moviepy: {e_raw}")
+            print(traceback.format_exc())
+        finally:
+            if 'final_clip_raw_moviepy' in locals() and hasattr(final_clip_raw_moviepy, 'close'):
+                final_clip_raw_moviepy.close()
+
+print(f"Script finished. Results in '{outdir}'")
