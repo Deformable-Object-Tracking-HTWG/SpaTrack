@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 import gc
 
-from eval_tof_utils.video_io import download_and_ensure_h264
+from eval_tof_utils.video_io import download_and_ensure_h264, is_h264, convert_to_h264, get_frames, prepare_video_and_eval
 from eval_tof_utils.masking import create_semantic_mask
 from eval_tof_utils.tracker import run_spatial_tracker
 from eval_tof_utils.tof_download import download_all_npy_from_nextcloud_folder
@@ -37,14 +37,16 @@ def parse_args() -> argparse.Namespace:
         description="End-to-end evaluation pipeline for RGB video + TOF data."
     )
 
-    # Core inputs
-    p.add_argument("--host", required=True, help="Nextcloud host, e.g. cloud.example.org")
-    p.add_argument("--public-token", required=True, help="Public share token")
-    p.add_argument("--slug", required=True,
-                   help="Clip slug (the only changing part), e.g. Gymnastik_6_5s")
+    # # Core inputs
+    # p.add_argument("--host", required=True, help="Nextcloud host, e.g. cloud.example.org")
+    # p.add_argument("--public-token", required=True, help="Public share token")
+    # p.add_argument("--slug", required=True,
+    #                help="Clip slug (the only changing part), e.g. Gymnastik_6_5s")
+    #
+    # # Optional password for the public share
+    # p.add_argument("--tof-share-password", default="", help="Password if the share is protected")
 
-    # Optional password for the public share
-    p.add_argument("--tof-share-password", default="", help="Password if the share is protected")
+    p.add_argument("--input-data", required=True, help="Directory of input data")
 
     # Environment
     p.add_argument("--base-dir", default="evaluation", help="Base directory for all runs")
@@ -90,15 +92,14 @@ def make_run_dirs(base_dir: Path, slug: str) -> dict[str, Path]:
 
     sub = {
         "run": run_dir,
-        "video": run_dir / "video",
         "mask": run_dir / "mask",
         "tracker": run_dir / "tracker",
-        "tof": run_dir / "tof",
         "analysis": run_dir / "analysis",
         "overlay": run_dir / "overlay",
     }
     for p in sub.values():
         p.mkdir(parents=True, exist_ok=True)
+        
     return sub
 
 
@@ -141,96 +142,115 @@ def main() -> None:
     base_dir = Path(args.base_dir)
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    video_url, tof_share_url, video_filename = build_urls(
-        host=args.host, token=args.public_token, slug=args.slug
-    )
+    # video_url, tof_share_url, video_filename = build_urls(
+    #     host=args.host, token=args.public_token, slug=args.slug
+    # )
+    #
+    # # 1) Video (download + ensure H.264)
+    # h264_video = download_and_ensure_h264(
+    #     url=video_url, folder=str(dirs["video"]), filename=video_filename
+    # )
 
-    dirs = make_run_dirs(base_dir, args.slug)
+    # 1) get content of all the evaluation data for bulk analysis
+    if not os.path.exists(args.input_data):
+        print(f'Input dir {args.input_data} does not exist!')
+        exit(2)
 
-    # 1) Video (download + ensure H.264)
-    h264_video = download_and_ensure_h264(
-        url=video_url, folder=str(dirs["video"]), filename=video_filename
-    )
-    if not h264_video:
-        fail("Video step failed")
+    for eval_target in os.listdir(args.input_data):
 
-    # 2) Mask (SAM + CLIP)
-    mask_path = None
-    try:
-        mask_path = create_semantic_mask(
+        local_path = f'{args.input_data}/{eval_target}/rgbd_data'
+
+        if not os.path.exists(local_path):
+            print(f'{local_path} does not exist!')
+            continue
+
+        try:
+            h264_video, tof_dir = prepare_video_and_eval(local_path, eval_target)
+        except RuntimeError as e:
+            print(f"❌ Error in {local_path}: {e}")
+            continue
+
+        dirs = make_run_dirs(base_dir, eval_target)
+        video_filename = f"{eval_target}.mp4"
+
+        # 2) Mask (SAM + CLIP)
+        mask_path = None
+        try:
+            mask_path = create_semantic_mask(
+                video_path=h264_video,
+                output_folder=str(dirs["mask"]),
+                reference_images_dir=args.ref_images,
+                sam_checkpoint=args.sam_checkpoint,
+                model_type=args.sam_model_type,
+                device=args.device,
+                use_center_priority=args.center_priority,
+                target_class="exercise ball",
+                disallow_classes=["person", "shirt", "man", "t-shirt"],
+                enforce_circularity=True,
+            )
+        finally:
+            print("🧹 Releasing GPU memory after mask generation ...")
+            cleanup_gpu(args.device)
+
+        if not mask_path:
+            fail("Mask creation failed")
+
+
+        # 3) Tracker
+        tracking_file = run_spatial_tracker(
             video_path=h264_video,
-            output_folder=str(dirs["mask"]),
-            reference_images_dir=args.ref_images,
-            sam_checkpoint=args.sam_checkpoint,
-            model_type=args.sam_model_type,
-            device=args.device,
-            use_center_priority=args.center_priority,
-            target_class="exercise ball",
-            disallow_classes=["person", "shirt", "man", "t-shirt"],
-            enforce_circularity=True,
+            mask_path=mask_path,
+            chunk_size=args.chunk_size,
+            output_folder=str(dirs["tracker"]),
+            tracker_script=args.tracker_script,
         )
-    finally:
-        print("🧹 Releasing GPU memory after mask generation ...")
-        cleanup_gpu(args.device)
+        if not tracking_file:
+            fail("SpatialTracker failed")
 
-    if not mask_path:
-        fail("Mask creation failed")
+        # # 4) TOF download
+        # print("\n📥 Downloading TOF .npy files ...")
+        # downloaded = download_all_npy_from_nextcloud_folder(
+        #     share_folder_url=tof_share_url,
+        #     target_dir=str(tof_dir),
+        #     password=args.tof_share_password,
+        # )
+        # if downloaded <= 0:
+        #     fail("No TOF .npy files downloaded")
 
+        # 5) Analysis
+        print("\n📊 Running analysis ...")
+        analyze_results(
+            tracking_file=tracking_file,
+            tof_data_folder=str(tof_dir),
+            output_dir=str(dirs["analysis"]),
+        )
 
-    # 3) Tracker
-    tracking_file = run_spatial_tracker(
-        video_path=h264_video,
-        mask_path=mask_path,
-        chunk_size=args.chunk_size,
-        output_folder=str(dirs["tracker"]),
-        tracker_script=args.tracker_script,
-    )
-    if not tracking_file:
-        fail("SpatialTracker failed")
+        # 6) Overlay TOF
+        print("\n🎥 Building TOF overlay video ...")
+        overlay_fps = probe_video_fps(h264_video) or 30.0
+        overlay_out = dirs["overlay"] / f"{Path(video_filename).stem}_tof_overlay.mp4"
+        info = create_tof_overlay_video(
+            tracking_file=tracking_file,
+            tof_data_folder=str(tof_dir),
+            out_path=str(overlay_out),
+            fps=overlay_fps,
+            mask_path=mask_path,
+            colormap="turbo",
+            percentiles=(1, 99),
+            mask_zero=True,
+            global_norm=True,
+            point_radius=4,
+            point_thickness=-1,
+            draw_ids=False,
+            tail_length=10,
+            h264_crf=23,
+            h264_preset="slow",
+        )
+        print("✔️ Overlay:", info.get("final_out_path"))
 
-    # 4) TOF download
-    print("\n📥 Downloading TOF .npy files ...")
-    downloaded = download_all_npy_from_nextcloud_folder(
-        share_folder_url=tof_share_url,
-        target_dir=str(dirs["tof"]),
-        password=args.tof_share_password,
-    )
-    if downloaded <= 0:
-        fail("No TOF .npy files downloaded")
-
-    # 5) Analysis
-    print("\n📊 Running analysis ...")
-    analyze_results(
-        tracking_file=tracking_file,
-        tof_data_folder=str(dirs["tof"]),
-        output_dir=str(dirs["analysis"]),
-    )
-
-    # 6) Overlay TOF
-    print("\n🎥 Building TOF overlay video ...")
-    overlay_fps = probe_video_fps(h264_video) or 30.0
-    overlay_out = dirs["overlay"] / f"{Path(video_filename).stem}_tof_overlay.mp4"
-    info = create_tof_overlay_video(
-        tracking_file=tracking_file,
-        tof_data_folder=str(dirs["tof"]),
-        out_path=str(overlay_out),
-        fps=overlay_fps,
-        mask_path=mask_path,
-        colormap="turbo",
-        percentiles=(1, 99),
-        mask_zero=True,
-        global_norm=True,
-        point_radius=4,
-        point_thickness=-1,
-        draw_ids=False,
-        tail_length=10,
-        h264_crf=23,
-        h264_preset="slow",
-    )
-    print("✔️ Overlay:", info.get("final_out_path"))
-
-    print(f"\n✅ Done. Run folder: {dirs['run']}")
+        print(f"\n✅ Done. Run folder: {dirs['run']}")
 
 
 if __name__ == "__main__":
     main()
+
