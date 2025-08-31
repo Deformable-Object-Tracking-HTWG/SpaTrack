@@ -88,7 +88,8 @@ def build_urls(host: str, token: str, slug: str) -> tuple[str, str, str]:
 
 def make_run_dirs(base_dir: Path, slug: str) -> dict[str, Path]:
     stamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = base_dir / f"{stamp}_{slug}"
+    # run_dir = base_dir / f"{stamp}_{slug}"
+    run_dir = base_dir / slug
 
     sub = {
         "run": run_dir,
@@ -101,11 +102,6 @@ def make_run_dirs(base_dir: Path, slug: str) -> dict[str, Path]:
         p.mkdir(parents=True, exist_ok=True)
         
     return sub
-
-
-def fail(msg: str) -> None:
-    print(f"❌ {msg}")
-    sys.exit(1)
 
 
 def cleanup_gpu(device: str) -> None:
@@ -193,8 +189,8 @@ def main() -> None:
             cleanup_gpu(args.device)
 
         if not mask_path:
-            fail("Mask creation failed")
-
+            print("❌ Mask creation failed")
+            continue
 
         # 3) Tracker
         tracking_file = run_spatial_tracker(
@@ -205,7 +201,8 @@ def main() -> None:
             tracker_script=args.tracker_script,
         )
         if not tracking_file:
-            fail("SpatialTracker failed")
+            print("❌ SpatialTracker failed")
+            continue
 
         # # 4) TOF download
         # print("\n📥 Downloading TOF .npy files ...")
@@ -215,7 +212,8 @@ def main() -> None:
         #     password=args.tof_share_password,
         # )
         # if downloaded <= 0:
-        #     fail("No TOF .npy files downloaded")
+        #     print("❌ o TOF .npy files downloaded")
+        #     continue
 
         # 5) Analysis
         print("\n📊 Running analysis ...")

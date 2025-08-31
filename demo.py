@@ -14,6 +14,7 @@ import cv2
 import argparse
 from moviepy.editor import ImageSequenceClip
 import torchvision.transforms as transforms
+from eval_tof_utils.masking import create_semantic_mask
 
 
 #-------- import cotracker -------------
@@ -59,7 +60,15 @@ parser.add_argument('--query_frame', type=int, default=0, help='query frame')
 parser.add_argument('--point_size', type=int, default=3, help='point size')
 # take the RGBD as input
 parser.add_argument('--rgbd', action='store_true', help='whether to take the RGBD as input')
-
+# set the params for the masks generation
+parser.add_argument("--generate-mask", action="store_true",
+                   help="whether to generate a segmentation mask")
+parser.add_argument("--ref-images", default="",
+                   help="Directory with reference images used for CLIP similarity")
+parser.add_argument("--center-priority", action="store_true",
+                   help="Prefer segment closest to center (overrides CLIP)")
+parser.add_argument("--target_class", type=string, default = None, help="text prompt used for CLIP similarity")
+parser.add_argument("--sam-checkpoint", type=str, help="Path to SAM Checkpoint")
 
 args = parser.parse_args()
 
@@ -86,6 +95,18 @@ transform = transforms.Compose([
                             int(512*args.crop_factor))),  
 ])
 _, T, _, H, W = video.shape
+if args.generate_mask:
+    try:
+        mask_path = create_semantic_mask(
+            video_path=vid_dir,
+            output_folder=str(outdir),
+            reference_images_dir=args.ref_images,
+            sam_checkpoint=args.sam_checkpoint,
+            use_center_priority=args.center_priority,
+            target_class=args.target_class
+        )
+    finally:
+        seg_dir = mask_path
 if os.path.exists(seg_dir):
     segm_mask = np.array(Image.open(seg_dir))
 else:

@@ -8,3 +8,6 @@ python chunked_demo.py \
 --outdir ../../subs_prep/output \
 --fps_vis 30 \
 --rgbd \
+--ref-images "/home/TP_tracking/Documents/SpaTrack/eval_tof_utils/reference_images/" \
+--sam-checkpoint "/home/TP_tracking/Documents/segment_anything/sam_vit_h_4b8939.pth" \
+--generate-mask \

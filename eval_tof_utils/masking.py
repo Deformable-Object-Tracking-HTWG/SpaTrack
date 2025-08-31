@@ -95,6 +95,13 @@ def create_semantic_mask(
     H, W = frame_rgb.shape[:2]
     stem = os.path.splitext(os.path.basename(video_path))[0]
 
+    mask_path = os.path.join(output_folder, f"{stem}_best_mask.png")
+    vis_path = os.path.join(output_folder, f"{stem}_best_visualization.png")
+
+    if os.path.isfile(mask_path):
+        print('Maks already created')
+        return mask_path
+
     # --- SAM ---
     sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
     sam.to(device=device)
@@ -201,9 +208,6 @@ def create_semantic_mask(
     overlay = frame_rgb.copy()
     overlay[best] = [0, 255, 0]
     vis = (0.7 * frame_rgb + 0.3 * overlay).astype(np.uint8)
-
-    mask_path = os.path.join(output_folder, f"{stem}_best_mask.png")
-    vis_path = os.path.join(output_folder, f"{stem}_best_visualization.png")
 
     cv2.imwrite(mask_path, mask_out)
     cv2.imwrite(vis_path, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))

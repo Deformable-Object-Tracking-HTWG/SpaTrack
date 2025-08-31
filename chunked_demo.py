@@ -16,10 +16,12 @@ import torchvision.transforms as transforms
 from moviepy.editor import ImageSequenceClip
 import moviepy
 
+
 # Import necessary modules from the existing project
 from models.spatracker.predictor import SpaTrackerPredictor
 from models.spatracker.utils.visualizer import Visualizer, read_video_from_path
 from models.spatracker.models.core.spatracker.spatracker import get_points_on_a_grid
+from eval_tof_utils.masking import create_semantic_mask
 from mde import MonoDEst
 
 # ---------------------- Helpers ----------------------
@@ -56,6 +58,11 @@ parser.add_argument('--point_size', type=int, default=3, help='Size of the visua
 parser.add_argument('--rgbd', action='store_true', help='Whether to use RGBD as input (expects pre-computed depth maps)')
 parser.add_argument('--chunk_size', type=int, default=30, help='Number of frames per processing chunk (output segment length)')
 parser.add_argument('--s_length_model', type=int, default=12, help="SpaTracker's internal processing window length (S_length)")
+parser.add_argument("--generate-mask", action="store_true", help="whether to generate a segmentation mask")
+parser.add_argument("--ref-images", default="", help="Directory with reference images used for CLIP similarity")
+parser.add_argument("--center-priority", action="store_true", help="whether prefer segment closest to center (overrides CLIP)")
+parser.add_argument("--target_class", type=str, default = None, help="text prompt used for CLIP similarity")
+parser.add_argument("--sam-checkpoint", type=str, help="Path to SAM Checkpoint")
 
 args = parser.parse_args()
 # args.rgbd
@@ -99,6 +106,19 @@ video_np = read_video_from_path(vid_path)  # Returns uint8 HWC RGB numpy
 video_full_torch = torch.from_numpy(video_np).permute(0, 3, 1, 2)[None].float()  # B T C H W, values 0-255
 
 H_raw, W_raw = video_full_torch.shape[-2:]
+mask_path = None
+if args.generate_mask:
+    try:
+        mask_path = create_semantic_mask(
+            video_path=vid_path,
+            output_folder=str(outdir),
+            reference_images_dir=args.ref_images,
+            sam_checkpoint=args.sam_checkpoint,
+            use_center_priority=args.center_priority,
+            target_class=args.target_class
+        )
+    finally:
+        seg_path = mask_path
 if os.path.exists(seg_path):
     print(f"Loading segmentation mask from: {seg_path}")
     segm_mask_np_raw = np.array(Image.open(seg_path))
