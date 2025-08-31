@@ -63,6 +63,8 @@ parser.add_argument("--ref-images", default="", help="Directory with reference i
 parser.add_argument("--center-priority", action="store_true", help="whether prefer segment closest to center (overrides CLIP)")
 parser.add_argument("--target_class", type=str, default = None, help="text prompt used for CLIP similarity")
 parser.add_argument("--sam-checkpoint", type=str, help="Path to SAM Checkpoint")
+parser.add_argument('--depth_model', type=str, default='zoe', help="Which Depth Estimation Model to use (zoe, depth_anything)")
+
 
 args = parser.parse_args()
 # args.rgbd
@@ -258,13 +260,20 @@ if args.rgbd:
             args.rgbd = False
 
 if not args.rgbd:
-    print("Initializing Monocular Depth Estimator (ZoeDepth NK)...")
-    monodepth = MonoDEst(edict({"mde_name": "zoedepth_nk"}))
+
+    if args.depth_model == 'zoe':
+        print("Initializing Monocular Depth Estimator (ZoeDepth NK)...")
+        monodepth = MonoDEst(edict({"mde_name": "zoedepth_nk"}))
+    elif args.depth_model == 'depth_anything':
+        print("Initializing Monocular Depth Estimator (Depth Anything)...")
+        monodepth = MonoDEst(edict({"mde_name": "depthAny"}))
+    else:
+        print('ERROR: Depth Model not known')
+
     depth_predictor_model_instance = monodepth.model
     if torch.cuda.is_available():
         depth_predictor_model_instance = depth_predictor_model_instance.to(device)
     depth_predictor_model_instance.eval()
-
 # ---------------------- Chunking and Processing ----------------------
 S_MODEL_INTERNAL_WINDOW = args.s_length_model
 overlap_frames = S_MODEL_INTERNAL_WINDOW // 2
